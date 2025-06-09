@@ -2416,6 +2416,12 @@ static unsigned int GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
 bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
                                CCoinsViewCache& view, bool fJustCheck)
 {
+    // Check BMM block if enabled
+    if (m_chainman.GetConsensus().fBMMEnabled) {
+        return BMM::ConnectBMMBlock(block, state, pindex, view);
+    }
+
+    // Original Bitcoin Core block connection
     AssertLockHeld(cs_main);
     assert(pindex);
 
@@ -2430,7 +2436,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // ContextualCheckBlockHeader() here. This means that if we add a new
     // consensus rule that is enforced in one of those two functions, then we
     // may have let in a block that violates the rule prior to updating the
-    // software, and we would NOT be enforcing the rule here. Fully solving
+    // software, and we wouldn't be enforcing the rule here. Fully solving
     // upgrade from one software version to the next after a consensus rule
     // change is potentially tricky and issue-specific (see NeedsRedownload()
     // for one approach that was used for BIP 141 deployment).
@@ -2468,6 +2474,8 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         // We've been configured with the hash of a block which has been externally verified to have a valid history.
         // A suitable default value is included with the software and updated from time to time.  Because validity
         //  relative to a piece of software is an objective fact these defaults can be easily reviewed.
+        // This setting doesn't force the selection of any particular chain but makes validating some faster by
+        //  effectively caching the result of part of the verification.
         // This setting doesn't force the selection of any particular chain but makes validating some faster by
         //  effectively caching the result of part of the verification.
         BlockMap::const_iterator it{m_blockman.m_block_index.find(m_chainman.AssumedValidBlock())};
@@ -4033,8 +4041,12 @@ static bool CheckWitnessMalleation(const CBlock& block, bool expect_witness_comm
 
 bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensus::Params& consensusParams, bool fCheckPOW, bool fCheckMerkleRoot)
 {
-    // These are checks that are independent of context.
+    // Check BMM block if enabled
+    if (consensusParams.fBMMEnabled) {
+        return BMM::CheckBMMBlock(block, state, consensusParams);
+    }
 
+    // Original Bitcoin Core block validation
     if (block.fChecked)
         return true;
 
@@ -4153,7 +4165,7 @@ bool IsBlockMutated(const CBlock& block, bool check_witness_root)
 
     if (block.vtx.empty() || !block.vtx[0]->IsCoinBase()) {
         // Consider the block mutated if any transaction is 64 bytes in size (see 3.1
-        // in "Weaknesses in Bitcoin’s Merkle Root Construction":
+        // in "Weaknesses in Bitcoin's Merkle Root Construction":
         // https://lists.linuxfoundation.org/pipermail/bitcoin-dev/attachments/20190225/a27d8837/attachment-0001.pdf).
         //
         // Note: This is not a consensus change as this only applies to blocks that
@@ -5228,7 +5240,6 @@ bool ChainstateManager::ShouldCheckBlockIndex() const
     if (!*Assert(m_options.check_block_index)) return false;
     if (FastRandomContext().randrange(*m_options.check_block_index) >= 1) return false;
     return true;
-}
 
 void ChainstateManager::CheckBlockIndex() const
 {
