@@ -11,6 +11,7 @@
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
 #include <consensus/validation.h>
+#include <drivechain/messages.h>
 #include <policy/feerate.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
@@ -82,7 +83,21 @@ bool IsStandard(const CScript& scriptPubKey, TxoutType& whichType)
     whichType = Solver(scriptPubKey, vSolutions);
 
     if (whichType == TxoutType::NONSTANDARD) {
-        return false;
+        // A BIP300 sidechain treasury output is not a script type the solver
+        // knows, and refusing to relay it would keep every deposit out of the
+        // mempool: an M5 deposit is precisely a transaction that creates one.
+        // Core has made a soft fork's output type standard ahead of its
+        // activation before -- sending to a v1 witness program relayed well
+        // before taproot locked in -- for the same reason, that wallets cannot
+        // be ready for a rule that their transactions cannot reach a miner
+        // under.
+        //
+        // Note that this is not gated on the deployment. Before activation
+        // such an output is anyone-can-spend to every node on the network, and
+        // relay policy does not change who may take it. A reviewer who wants
+        // the gate anyway should look at MemPoolAccept, which is the only
+        // caller with the chain state to decide it.
+        return drivechain::ParseTreasuryScript(scriptPubKey).has_value();
     } else if (whichType == TxoutType::MULTISIG) {
         unsigned char m = vSolutions.front()[0];
         unsigned char n = vSolutions.back()[0];
