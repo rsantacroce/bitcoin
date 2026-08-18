@@ -65,12 +65,14 @@ follows that split:
 | `src/drivechain/params.{h,cpp}` | thresholds and activation, per network |
 | `src/drivechain/validation.{h,cpp}` | the rules a block must satisfy |
 
+| `src/rpc/drivechain.cpp` | read-only calls reporting the state |
+
 The chainstate owns a `DrivechainDB` beside its coins database, and
 `ConnectBlock` and `DisconnectBlock` take the sidechain state the way they take
 the coins view.
 
-Later phases add the rest of mempool policy and the RPCs the external services
-need. This document grows with them.
+What is still missing: the deposit sequence index and the two RPCs that read it,
+and a differential harness against the reference implementation.
 
 Everything under `src/drivechain/` is new code; the diff against upstream files
 is deliberately kept to a handful of call sites so that the patchset stays
@@ -162,6 +164,17 @@ rather than guessed at.
 A chainstate loaded from a UTXO snapshot describes no block, so these rules are
 not enforced on it: it has no history to derive the state from and the snapshot
 carries none. Its blocks are validated by the background chainstate, which does.
+
+**Phase 6** is mempool policy and the RPC surface.
+
+27. keeping transactions that cannot be mined out of the mempool
+28. read-only calls reporting the state
+
+Neither is consensus. A node that admits too much to its mempool wastes a block
+template it will itself reject; a node that admits too little only declines to
+relay. Only the mempool's half of the BMM request rules can be decided there at
+all, since the accept that would match a request does not exist yet — which is
+also what the reference implementation does.
 
 ## Notes for implementers
 

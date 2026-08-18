@@ -595,6 +595,23 @@ bool HandleM8(const CTransaction& tx,
     return true;
 }
 
+bool AcceptTx(const CTransaction& tx,
+              const DrivechainState& state,
+              const Thresholds& thresholds,
+              const uint256& tip_hash,
+              BlockError& error)
+{
+    std::optional<TxDiff> tx_diff;
+    if (!HandleTreasuryTx(tx, state, thresholds, tx_diff, error)) return false;
+
+    // No coinbase to check against, so the rule that a request must name a
+    // side:block this block accepted cannot be decided -- the M7 that would
+    // accept it does not exist yet. Only the expiry rule can be, and it is the
+    // one that matters here: it is what stops stale requests accumulating.
+    std::optional<SlotNum> requested;
+    return HandleM8(tx, /*accepted=*/nullptr, tip_hash, requested, error);
+}
+
 AckBundles ResolvedVotes(const BlockDiff& diff)
 {
     // At most one M4 per block, so at most one of these.
