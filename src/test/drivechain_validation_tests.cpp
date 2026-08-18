@@ -1436,4 +1436,45 @@ BOOST_AUTO_TEST_CASE(resolved_votes_are_what_a_repeat_replays)
     BOOST_CHECK(ResolvedVotes(quiet).actions.empty());
 }
 
+BOOST_AUTO_TEST_CASE(the_mempool_keeps_out_what_could_never_be_mined)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+    const COutPoint treasury{GiveTreasury(state, 1, 10000)};
+    const uint256 tip{uint256{77}};
+
+    BlockError error{BlockError::STATE_MISMATCH};
+
+    // An ordinary transaction is none of this code's business.
+    CMutableTransaction ordinary;
+    ordinary.vin.emplace_back(SomeOutPoint(1));
+    ordinary.vout.emplace_back(1000, CScript() << OP_TRUE);
+    BOOST_CHECK(AcceptTx(CTransaction{ordinary}, state, SHORT_THRESHOLDS, tip, error));
+
+    // A transaction that would take the treasury and put nothing back can
+    // never appear in a valid block, so it should never sit in a mempool
+    // waiting to be mined into one.
+    CMutableTransaction theft;
+    theft.vin.emplace_back(treasury);
+    theft.vout.emplace_back(10000, CScript() << OP_TRUE);
+    BOOST_CHECK(!AcceptTx(CTransaction{theft}, state, SHORT_THRESHOLDS, tip, error));
+    BOOST_CHECK(error == BlockError::TREASURY_SPENT_WITHOUT_NEW_CTIP);
+}
+
+BOOST_AUTO_TEST_CASE(the_mempool_judges_a_request_only_on_expiry)
+{
+    // The M7 that would accept a request does not exist while the request is
+    // in the mempool, so the rule that a request must match one cannot be
+    // applied there. The expiry rule can, and it is the one that stops stale
+    // requests accumulating.
+    DrivechainState state;
+    const uint256 tip{uint256{77}};
+    BlockError error{BlockError::STATE_MISMATCH};
+
+    BOOST_CHECK(AcceptTx(CTransaction{M8Tx(1, uint256{11}, tip)}, state, SHORT_THRESHOLDS, tip, error));
+
+    BOOST_CHECK(!AcceptTx(CTransaction{M8Tx(1, uint256{11}, uint256{5})}, state, SHORT_THRESHOLDS, tip, error));
+    BOOST_CHECK(error == BlockError::BMM_REQUEST_EXPIRED);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

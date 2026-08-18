@@ -905,6 +905,28 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_INPUTS_NOT_STANDARD, "bad-txns-nonstandard-inputs");
     }
 
+    // BIP300/BIP301: keep out transactions that could not appear in the next
+    // block. This is policy, not consensus -- the decision that matters is made
+    // in ConnectBlock -- so a failure here only declines to relay.
+    {
+        const CBlockIndex* tip{m_active_chainstate.m_chain.Tip()};
+        const Consensus::Params& consensus{m_active_chainstate.m_chainman.GetConsensus()};
+        if (tip != nullptr && tip->nHeight + 1 >= consensus.drivechain_activation_height &&
+            m_active_chainstate.DrivechainTip().GetBestBlock() == tip->GetBlockHash()) {
+            drivechain::BlockError drivechain_error{};
+            if (!drivechain::AcceptTx(tx, m_active_chainstate.DrivechainTip(), consensus.drivechain_thresholds,
+                                      tip->GetBlockHash(), drivechain_error)) {
+                // A request that named an earlier block is an ordinary race
+                // rather than misbehaviour, so it is not treated as a consensus
+                // failure a peer should be punished for.
+                const bool expired{drivechain_error == drivechain::BlockError::BMM_REQUEST_EXPIRED};
+                return state.Invalid(expired ? TxValidationResult::TX_MEMPOOL_POLICY
+                                             : TxValidationResult::TX_CONSENSUS,
+                                     drivechain::BlockErrorString(drivechain_error));
+            }
+        }
+    }
+
     // Check for non-standard witnesses.
     if (tx.HasWitness() && m_pool.m_opts.require_standard && !IsWitnessStandard(tx, m_view)) {
         return state.Invalid(TxValidationResult::TX_WITNESS_MUTATED, "bad-witness-nonstandard");

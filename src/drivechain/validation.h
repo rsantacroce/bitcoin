@@ -271,6 +271,29 @@ static constexpr uint16_t LEADING_BY_50_MARGIN{50};
                             std::optional<SlotNum>& slot,
                             BlockError& error);
 
+/**
+ * Whether a transaction could appear in the next block.
+ *
+ * Runs the transaction rules -- the treasury rules, and the part of the BMM
+ * request rules that can be decided without a coinbase -- against the state as
+ * it stands at the tip. This is what keeps a transaction that could never be
+ * mined out of the mempool.
+ *
+ * It is not a security boundary. A node that admits too much builds a block
+ * template it will itself reject when it comes to connect it, which wastes a
+ * template rather than the chain; and a node that admits too little only
+ * declines to relay. The consensus decision is made in ConnectBlock and nowhere
+ * else.
+ *
+ * `tip_hash` is the current tip, which is what an M8 in the mempool must name
+ * as its parent: a request is written for one block and expires with it.
+ */
+[[nodiscard]] bool AcceptTx(const CTransaction& tx,
+                            const DrivechainState& state,
+                            const Thresholds& thresholds,
+                            const uint256& tip_hash,
+                            BlockError& error);
+
 //! What a block needs to know about the one before it.
 struct BlockContext {
     //! Height of the block being connected.
