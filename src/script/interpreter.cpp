@@ -8,6 +8,7 @@
 #include <crypto/ripemd160.h>
 #include <crypto/sha1.h>
 #include <crypto/sha256.h>
+#include <drivechain/messages.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <tinyformat.h>
@@ -595,8 +596,21 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                 case OP_NOP1: case OP_NOP4: case OP_NOP5:
                 case OP_NOP6: case OP_NOP7: case OP_NOP8: case OP_NOP9: case OP_NOP10:
                 {
-                    if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS)
-                        return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
+                    if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS) {
+                        // BIP300 gives OP_NOP5 a meaning when the whole script
+                        // is exactly `OP_NOP5 OP_PUSHBYTES_1 <slot> OP_TRUE`:
+                        // the output is a sidechain treasury. Consensus still
+                        // executes it as a no-op -- that is what makes BIP300 a
+                        // soft fork, and why spending a treasury is authorised
+                        // in ConnectBlock rather than here -- but discouraging
+                        // it as an unknown upgrade would keep every deposit and
+                        // withdrawal out of the mempool.
+                        const bool is_treasury{(flags & SCRIPT_VERIFY_DRIVECHAIN) &&
+                                               drivechain::ParseTreasuryScript(script).has_value()};
+                        if (!is_treasury) {
+                            return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_NOPS);
+                        }
+                    }
                 }
                 break;
 
@@ -2190,6 +2204,7 @@ const std::map<std::string, script_verify_flag_name>& ScriptFlagNamesToEnum()
         FLAG_NAME(DISCOURAGE_UPGRADABLE_PUBKEYTYPE),
         FLAG_NAME(DISCOURAGE_OP_SUCCESS),
         FLAG_NAME(DISCOURAGE_UPGRADABLE_TAPROOT_VERSION),
+        FLAG_NAME(DRIVECHAIN),
     };
 #undef FLAG_NAME
     return g_names_to_enum;
