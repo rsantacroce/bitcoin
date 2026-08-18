@@ -5,6 +5,7 @@
 #ifndef BITCOIN_DRIVECHAIN_MESSAGES_H
 #define BITCOIN_DRIVECHAIN_MESSAGES_H
 
+#include <primitives/transaction_identifier.h>
 #include <script/script.h>
 #include <uint256.h>
 
@@ -133,7 +134,8 @@ struct M3ProposeBundle {
     static constexpr std::array<unsigned char, MESSAGE_TAG_SIZE> TAG{0xD4, 0x5A, 0xA9, 0x43};
 
     SlotNum slot;
-    uint256 m6id;
+    //! The blinded withdrawal's txid; see BlindM6 in drivechain/m6id.h.
+    Txid m6id;
 };
 
 /** M4 — acknowledge withdrawal bundles, one vote per active sidechain slot.

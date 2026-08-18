@@ -42,6 +42,7 @@ add_executable(test_bitcoin
   denialofservice_tests.cpp
   descriptor_tests.cpp
   disconnected_transactions.cpp
+  drivechain_m6id_tests.cpp
   drivechain_messages_tests.cpp
   feefrac_tests.cpp
   feerounder_tests.cpp

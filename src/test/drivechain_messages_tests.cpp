@@ -207,7 +207,7 @@ BOOST_AUTO_TEST_CASE(m3_propose_bundle)
     const auto* m3{std::get_if<M3ProposeBundle>(&*message)};
     BOOST_REQUIRE(m3 != nullptr);
     BOOST_CHECK_EQUAL(int{m3->slot}, 1);
-    BOOST_CHECK(m3->m6id == m6id);
+    BOOST_CHECK(m3->m6id == Txid::FromUint256(m6id));
 }
 
 BOOST_AUTO_TEST_CASE(m4_versions_without_votes)

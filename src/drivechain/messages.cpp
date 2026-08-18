@@ -155,7 +155,7 @@ std::optional<CoinbaseMessage> ParseCoinbaseMessage(const CScript& script)
     if (const auto body{MatchTag(*payload, M3ProposeBundle::TAG)}) {
         const auto parsed{ParseSlotAndHash(*body)};
         if (!parsed) return std::nullopt;
-        return M3ProposeBundle{.slot = parsed->first, .m6id = parsed->second};
+        return M3ProposeBundle{.slot = parsed->first, .m6id = Txid::FromUint256(parsed->second)};
     }
     if (const auto body{MatchTag(*payload, M4AckBundles::TAG)}) {
         const auto parsed{ParseM4Body(*body)};
