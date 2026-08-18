@@ -145,6 +145,12 @@ enum class script_verify_flag_name : uint8_t {
     // Making unknown public key versions (in BIP 342 scripts) non-standard
     SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE,
 
+    // Making a BIP300 sidechain treasury output relayable, by exempting it
+    // from the upgradable-NOP discouragement above. Policy only: this flag
+    // never makes a script fail that would otherwise pass, and it is never set
+    // for consensus.
+    SCRIPT_VERIFY_DRIVECHAIN,
+
     // Constants to point to the highest flag in use. Add new flags above this line.
     //
     SCRIPT_VERIFY_END_MARKER
