@@ -2,7 +2,9 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
+#include <consensus/amount.h>
 #include <drivechain/diff.h>
+#include <drivechain/m6id.h>
 #include <drivechain/messages.h>
 #include <drivechain/params.h>
 #include <drivechain/state.h>
@@ -130,6 +132,38 @@ BlockError RejectM4(const M4AckBundles& m4, const DrivechainState& state)
     return error;
 }
 
+//! An opaque sidechain address output, as a deposit must carry.
+CScript AddressOutput()
+{
+    return CScript() << OP_RETURN << std::vector<unsigned char>{0xAB, 0xCD};
+}
+
+COutPoint SomeOutPoint(uint8_t seed) { return COutPoint{Txid::FromUint256(uint256{seed}), seed}; }
+
+//! Give `slot` an active sidechain holding a treasury of `value`.
+COutPoint GiveTreasury(DrivechainState& state, SlotNum slot, CAmount value, uint8_t seed = 200)
+{
+    const COutPoint outpoint{SomeOutPoint(seed)};
+    state.PutCtip(slot, Ctip{.outpoint = outpoint, .value = value});
+    return outpoint;
+}
+
+std::optional<TxDiff> HandleTx(const CMutableTransaction& tx, const DrivechainState& state)
+{
+    std::optional<TxDiff> out;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_REQUIRE(HandleTreasuryTx(CTransaction{tx}, state, SHORT_THRESHOLDS, out, error));
+    return out;
+}
+
+BlockError RejectTx(const CMutableTransaction& tx, const DrivechainState& state)
+{
+    std::optional<TxDiff> out;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_REQUIRE(!HandleTreasuryTx(CTransaction{tx}, state, SHORT_THRESHOLDS, out, error));
+    return error;
+}
+
 M2AckSidechain M2(const Sidechain& proposal)
 {
     return M2AckSidechain{.slot = proposal.slot, .proposal_id = proposal.Id().description_hash};
@@ -254,7 +288,12 @@ BOOST_AUTO_TEST_CASE(error_strings_are_distinct)
         BlockError::DUPLICATE_M7, BlockError::M3_INACTIVE_SIDECHAIN,
         BlockError::M3_BUNDLE_ALREADY_PENDING, BlockError::M4_TWO_BYTES_WITHIN_BYTE_RANGE,
         BlockError::M4_VOTE_COUNT_MISMATCH, BlockError::M4_BUNDLE_INDEX_OUT_OF_RANGE,
-        BlockError::STATE_MISMATCH,
+        BlockError::AMBIGUOUS_TREASURY_TX, BlockError::MISSING_DEPOSIT_ADDRESS,
+        BlockError::MULTIPLE_TREASURY_OUTPUTS, BlockError::OLD_CTIP_UNSPENT,
+        BlockError::TREASURY_SPENT_WITHOUT_NEW_CTIP, BlockError::ZERO_VALUE_CHANGE,
+        BlockError::M6_INPUT_COUNT, BlockError::M6_TREASURY_OUTPUT_INDEX,
+        BlockError::M6_TREASURY_OUTPUT_COUNT, BlockError::M6_UNKNOWN_BUNDLE,
+        BlockError::M6_INSUFFICIENT_VOTES, BlockError::STATE_MISMATCH,
     };
     std::set<std::string> seen;
     for (const BlockError error : errors) {
@@ -803,6 +842,261 @@ BOOST_AUTO_TEST_CASE(m4_votes_round_trip_through_the_diff)
     BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(1)->at(1).vote_count, 2);
     BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(1)->at(2).vote_count, 0);
     BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(2)->at(0).vote_count, 6);
+
+    UndoError undo_error{};
+    BOOST_REQUIRE(block.Undo(state, undo_error));
+    BOOST_CHECK(state == before);
+}
+
+BOOST_AUTO_TEST_CASE(an_ordinary_transaction_touches_no_treasury)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(SomeOutPoint(1));
+    tx.vout.emplace_back(1000, CScript() << OP_TRUE);
+    BOOST_CHECK(!HandleTx(tx, state).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(a_first_deposit_needs_no_input_to_spend)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(SomeOutPoint(1));
+    tx.vout.emplace_back(1000, TreasuryScript(1));
+    tx.vout.emplace_back(0, AddressOutput());
+
+    const auto diff{HandleTx(tx, state)};
+    BOOST_REQUIRE(diff.has_value());
+    const auto* m5{std::get_if<M5Diff>(&*diff)};
+    BOOST_REQUIRE(m5 != nullptr);
+    BOOST_CHECK_EQUAL(m5->ctips.at(1).new_ctip.value, 1000);
+    // Nothing to restore on undo: the slot had no treasury before.
+    BOOST_CHECK(!m5->ctips.at(1).had_previous);
+}
+
+BOOST_AUTO_TEST_CASE(a_deposit_must_carry_its_address)
+{
+    // Without it the deposit cannot be attributed to any sidechain account.
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(SomeOutPoint(1));
+    tx.vout.emplace_back(1000, TreasuryScript(1));
+    BOOST_CHECK(RejectTx(tx, state) == BlockError::MISSING_DEPOSIT_ADDRESS);
+
+    // It must follow the treasury immediately, not merely be present.
+    tx.vout.emplace_back(500, CScript() << OP_TRUE);
+    tx.vout.emplace_back(0, AddressOutput());
+    BOOST_CHECK(RejectTx(tx, state) == BlockError::MISSING_DEPOSIT_ADDRESS);
+}
+
+BOOST_AUTO_TEST_CASE(a_later_deposit_must_spend_the_old_treasury)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+    const COutPoint treasury{GiveTreasury(state, 1, 1000)};
+
+    // Creating a second treasury while the first is unspent would leave the
+    // slot with two, which is the one thing BIP-300 says must never happen.
+    CMutableTransaction unspent;
+    unspent.vin.emplace_back(SomeOutPoint(1));
+    unspent.vout.emplace_back(1500, TreasuryScript(1));
+    unspent.vout.emplace_back(0, AddressOutput());
+    BOOST_CHECK(RejectTx(unspent, state) == BlockError::OLD_CTIP_UNSPENT);
+
+    CMutableTransaction deposit;
+    deposit.vin.emplace_back(treasury);
+    deposit.vout.emplace_back(1500, TreasuryScript(1));
+    deposit.vout.emplace_back(0, AddressOutput());
+    const auto diff{HandleTx(deposit, state)};
+    BOOST_REQUIRE(diff.has_value());
+    const auto* m5{std::get_if<M5Diff>(&*diff)};
+    BOOST_REQUIRE(m5 != nullptr);
+    BOOST_CHECK(m5->ctips.at(1).had_previous);
+    BOOST_CHECK_EQUAL(m5->ctips.at(1).previous.value, 1000);
+}
+
+BOOST_AUTO_TEST_CASE(a_treasury_cannot_be_spent_without_a_replacement)
+{
+    // This is the rule that holds the peg. OP_DRIVECHAIN evaluates true with
+    // an empty scriptSig, so nothing in the script interpreter stops anyone
+    // taking the treasury; only this does.
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+    const COutPoint treasury{GiveTreasury(state, 1, 1000)};
+
+    CMutableTransaction theft;
+    theft.vin.emplace_back(treasury);
+    theft.vout.emplace_back(1000, CScript() << OP_TRUE);
+    BOOST_CHECK(RejectTx(theft, state) == BlockError::TREASURY_SPENT_WITHOUT_NEW_CTIP);
+}
+
+BOOST_AUTO_TEST_CASE(a_treasury_cannot_move_to_an_equal_value)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+    const COutPoint treasury{GiveTreasury(state, 1, 1000)};
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(treasury);
+    tx.vout.emplace_back(1000, TreasuryScript(1));
+    tx.vout.emplace_back(0, AddressOutput());
+    BOOST_CHECK(RejectTx(tx, state) == BlockError::ZERO_VALUE_CHANGE);
+}
+
+BOOST_AUTO_TEST_CASE(one_treasury_output_per_slot_per_transaction)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(SomeOutPoint(1));
+    tx.vout.emplace_back(1000, TreasuryScript(1));
+    tx.vout.emplace_back(0, AddressOutput());
+    tx.vout.emplace_back(500, TreasuryScript(1));
+    BOOST_CHECK(RejectTx(tx, state) == BlockError::MULTIPLE_TREASURY_OUTPUTS);
+}
+
+BOOST_AUTO_TEST_CASE(a_treasury_output_for_an_inactive_slot_is_ordinary)
+{
+    // For a slot with no sidechain in it, OP_DRIVECHAIN is an ordinary
+    // anyone-can-spend script. Without this the zero-value output below would
+    // read as a treasury moving to zero and reject a perfectly good block.
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(SomeOutPoint(1));
+    tx.vout.emplace_back(0, TreasuryScript(9));
+    BOOST_CHECK(!HandleTx(tx, state).has_value());
+
+    CMutableTransaction spend;
+    spend.vin.emplace_back(SomeOutPoint(2));
+    spend.vout.emplace_back(1000, TreasuryScript(9));
+    BOOST_CHECK(!HandleTx(spend, state).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(a_withdrawal_pays_out_an_approved_bundle)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+    const COutPoint treasury{GiveTreasury(state, 1, 10000)};
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(treasury);
+    tx.vout.emplace_back(6000, TreasuryScript(1));
+    tx.vout.emplace_back(3000, CScript() << OP_TRUE);
+
+    // The bundle miners voted on is the blinded form of this transaction.
+    M6Error m6_error{};
+    const auto blinded{BlindM6(CTransaction{tx}, 10000, m6_error)};
+    BOOST_REQUIRE(blinded.has_value());
+    BOOST_CHECK_EQUAL(blinded->fee, 1000);
+
+    // Not pending at all.
+    BOOST_CHECK(RejectTx(tx, state) == BlockError::M6_UNKNOWN_BUNDLE);
+
+    // Pending, but one vote short of the bar. SHORT_THRESHOLDS pays out above
+    // five, so five is not enough.
+    state.ModifyPendingWithdrawals(1)->push_back(PendingWithdrawal{
+        .m6id = blinded->m6id, .vote_count = 5, .proposal_height = 0});
+    BOOST_CHECK(RejectTx(tx, state) == BlockError::M6_INSUFFICIENT_VOTES);
+
+    state.ModifyPendingWithdrawals(1)->at(0).vote_count = 6;
+    const auto diff{HandleTx(tx, state)};
+    BOOST_REQUIRE(diff.has_value());
+    const auto* m6{std::get_if<M6Diff>(&*diff)};
+    BOOST_REQUIRE(m6 != nullptr);
+    BOOST_CHECK_EQUAL(int{m6->slot}, 1);
+    BOOST_CHECK_EQUAL(m6->removed_index, 0U);
+    BOOST_CHECK(m6->removed.m6id == blinded->m6id);
+    BOOST_CHECK(m6->ctip.had_previous);
+}
+
+BOOST_AUTO_TEST_CASE(a_withdrawal_has_one_input_and_its_treasury_first)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+    const COutPoint treasury{GiveTreasury(state, 1, 10000)};
+
+    CMutableTransaction two_inputs;
+    two_inputs.vin.emplace_back(treasury);
+    two_inputs.vin.emplace_back(SomeOutPoint(1));
+    two_inputs.vout.emplace_back(6000, TreasuryScript(1));
+    two_inputs.vout.emplace_back(3000, CScript() << OP_TRUE);
+    BOOST_CHECK(RejectTx(two_inputs, state) == BlockError::M6_INPUT_COUNT);
+
+    // The treasury change must be at vout[0]: the blinded form the vote
+    // committed to puts the fee marker at that index.
+    CMutableTransaction shifted;
+    shifted.vin.emplace_back(treasury);
+    shifted.vout.emplace_back(3000, CScript() << OP_TRUE);
+    shifted.vout.emplace_back(6000, TreasuryScript(1));
+    BOOST_CHECK(RejectTx(shifted, state) == BlockError::M6_TREASURY_OUTPUT_INDEX);
+}
+
+BOOST_AUTO_TEST_CASE(a_transaction_cannot_be_both_deposit_and_withdrawal)
+{
+    // One transaction, one input spending slot 2's treasury, which loses value
+    // while slot 1 gains a treasury it did not have. Read as a withdrawal it
+    // dodges the deposit rules; read as a deposit it dodges the vote.
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+    ActivateWith(state, 2, {});
+    const COutPoint treasury{GiveTreasury(state, 2, 10000)};
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(treasury);
+    tx.vout.emplace_back(6000, TreasuryScript(2));
+    tx.vout.emplace_back(2000, TreasuryScript(1));
+    tx.vout.emplace_back(0, AddressOutput());
+
+    // The withdrawal half has to pass its own rules first, or it is rejected
+    // under those instead and the ambiguity never comes up.
+    M6Error m6_error{};
+    const auto blinded{BlindM6(CTransaction{tx}, 10000, m6_error)};
+    BOOST_REQUIRE(blinded.has_value());
+    state.ModifyPendingWithdrawals(2)->push_back(PendingWithdrawal{
+        .m6id = blinded->m6id, .vote_count = 6, .proposal_height = 0});
+
+    BOOST_CHECK(RejectTx(tx, state) == BlockError::AMBIGUOUS_TREASURY_TX);
+}
+
+BOOST_AUTO_TEST_CASE(treasury_movement_round_trips_through_the_diff)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+    const COutPoint treasury{GiveTreasury(state, 1, 10000)};
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(treasury);
+    tx.vout.emplace_back(6000, TreasuryScript(1));
+    tx.vout.emplace_back(3000, CScript() << OP_TRUE);
+
+    M6Error m6_error{};
+    const auto blinded{BlindM6(CTransaction{tx}, 10000, m6_error)};
+    BOOST_REQUIRE(blinded.has_value());
+    state.ModifyPendingWithdrawals(1)->push_back(PendingWithdrawal{
+        .m6id = Txid::FromUint256(uint256{99}), .vote_count = 1, .proposal_height = 0});
+    state.ModifyPendingWithdrawals(1)->push_back(PendingWithdrawal{
+        .m6id = blinded->m6id, .vote_count = 6, .proposal_height = 0});
+
+    const auto diff{HandleTx(tx, state)};
+    BOOST_REQUIRE(diff.has_value());
+    BOOST_CHECK_EQUAL(std::get<M6Diff>(*diff).removed_index, 1U);
+
+    BlockDiff block;
+    block.txs.push_back(*diff);
+    const DrivechainState before{state};
+    BOOST_REQUIRE(block.Apply(state, 500));
+
+    BOOST_CHECK_EQUAL(state.GetCtip(1)->value, 6000);
+    BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(1)->size(), 1U);
 
     UndoError undo_error{};
     BOOST_REQUIRE(block.Undo(state, undo_error));

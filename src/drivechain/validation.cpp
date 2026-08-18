@@ -4,6 +4,7 @@
 
 #include <drivechain/validation.h>
 
+#include <drivechain/m6id.h>
 #include <drivechain/messages.h>
 #include <drivechain/params.h>
 #include <drivechain/state.h>
@@ -169,6 +170,17 @@ std::string BlockErrorString(BlockError error)
     case BlockError::M4_TWO_BYTES_WITHIN_BYTE_RANGE: return "bad-drivechain-m4-two-bytes-unnecessary";
     case BlockError::M4_VOTE_COUNT_MISMATCH: return "bad-drivechain-m4-vote-count";
     case BlockError::M4_BUNDLE_INDEX_OUT_OF_RANGE: return "bad-drivechain-m4-bundle-index";
+    case BlockError::AMBIGUOUS_TREASURY_TX: return "bad-drivechain-ambiguous-treasury-tx";
+    case BlockError::MISSING_DEPOSIT_ADDRESS: return "bad-drivechain-missing-deposit-address";
+    case BlockError::MULTIPLE_TREASURY_OUTPUTS: return "bad-drivechain-multiple-treasury-outputs";
+    case BlockError::OLD_CTIP_UNSPENT: return "bad-drivechain-old-treasury-unspent";
+    case BlockError::TREASURY_SPENT_WITHOUT_NEW_CTIP: return "bad-drivechain-treasury-spent-without-replacement";
+    case BlockError::ZERO_VALUE_CHANGE: return "bad-drivechain-zero-value-change";
+    case BlockError::M6_INPUT_COUNT: return "bad-drivechain-m6-input-count";
+    case BlockError::M6_TREASURY_OUTPUT_INDEX: return "bad-drivechain-m6-treasury-output-index";
+    case BlockError::M6_TREASURY_OUTPUT_COUNT: return "bad-drivechain-m6-treasury-output-count";
+    case BlockError::M6_UNKNOWN_BUNDLE: return "bad-drivechain-m6-unknown-bundle";
+    case BlockError::M6_INSUFFICIENT_VOTES: return "bad-drivechain-m6-insufficient-votes";
     case BlockError::STATE_MISMATCH: return "drivechain-state-mismatch";
     }
     return "bad-drivechain-unknown";
@@ -367,6 +379,172 @@ bool HandleM4(const M4AckBundles& m4,
 
     error = BlockError::STATE_MISMATCH;
     return false;
+}
+
+bool HandleTreasuryTx(const CTransaction& tx,
+                      const DrivechainState& state,
+                      const Thresholds& thresholds,
+                      std::optional<TxDiff>& out,
+                      BlockError& error)
+{
+    out.reset();
+
+    // Which treasuries this transaction spends. A slot keeps its treasury even
+    // if its sidechain stops being active, so every pointer is considered, not
+    // only those of active slots.
+    std::map<SlotNum, CAmount> spent;
+    for (const CTxIn& input : tx.vin) {
+        for (const auto& [slot, ctip] : state.Ctips()) {
+            if (ctip.outpoint == input.prevout) spent[slot] = ctip.value;
+        }
+    }
+
+    // Which treasuries it creates. Iteration is ordered by slot, so when a
+    // transaction breaks several rules at once the one reported is the same on
+    // every node -- not that validity depends on it, but a reject reason that
+    // varied by node would be miserable to debug.
+    std::map<SlotNum, std::pair<uint32_t, Ctip>> created;
+    for (uint32_t vout{0}; vout < tx.vout.size(); ++vout) {
+        const std::optional<SlotNum> slot{ParseTreasuryScript(tx.vout[vout].scriptPubKey)};
+        if (!slot) continue;
+
+        // An OP_DRIVECHAIN output designates a treasury only for a slot that
+        // holds an active sidechain. For any other slot it is an ordinary
+        // anyone-can-spend output and the block is valid: without this guard a
+        // zero-value output naming a nonexistent sidechain would be read as a
+        // treasury moving to zero and reject a perfectly good block.
+        if (!state.IsActive(*slot)) continue;
+
+        const Ctip ctip{.outpoint = COutPoint{tx.GetHash(), vout}, .value = tx.vout[vout].nValue};
+        if (!created.emplace(*slot, std::make_pair(vout, ctip)).second) {
+            error = BlockError::MULTIPLE_TREASURY_OUTPUTS;
+            return false;
+        }
+    }
+
+    // Spending a treasury without putting one back would drain the slot, and
+    // the script interpreter will not stop it.
+    for (const auto& [slot, value] : spent) {
+        if (created.count(slot) == 0) {
+            error = BlockError::TREASURY_SPENT_WITHOUT_NEW_CTIP;
+            return false;
+        }
+    }
+
+    M5Diff deposits;
+    std::optional<M6Diff> withdrawal;
+
+    for (const auto& [slot, entry] : created) {
+        const auto& [vout, new_ctip] = entry;
+
+        CAmount previous_value{0};
+        TreasuryChange change{.new_ctip = new_ctip};
+        if (const Ctip* existing{state.GetCtip(slot)}) {
+            // A slot has at most one treasury, so creating a second without
+            // spending the first would be two at once -- the invariant the
+            // whole design rests on.
+            const auto it{spent.find(slot)};
+            if (it == spent.end()) {
+                error = BlockError::OLD_CTIP_UNSPENT;
+                return false;
+            }
+            previous_value = it->second;
+            change.had_previous = true;
+            change.previous = *existing;
+        }
+
+        if (new_ctip.value == previous_value) {
+            // Neither a deposit nor a withdrawal.
+            error = BlockError::ZERO_VALUE_CHANGE;
+            return false;
+        }
+
+        if (new_ctip.value > previous_value) {
+            // A deposit. BIP-300 requires the opaque sidechain address in an
+            // OP_RETURN immediately after the treasury output; without it the
+            // deposit cannot be attributed to any account on the sidechain.
+            if (vout + 1 >= tx.vout.size() || !ParseOpReturnPayload(tx.vout[vout + 1].scriptPubKey)) {
+                error = BlockError::MISSING_DEPOSIT_ADDRESS;
+                return false;
+            }
+            if (withdrawal) {
+                error = BlockError::AMBIGUOUS_TREASURY_TX;
+                return false;
+            }
+            deposits.ctips[slot] = change;
+            continue;
+        }
+
+        // A withdrawal. The structural checks come before the ambiguity check,
+        // matching the order the reference implementation uses: which rule a
+        // transaction breaking several at once is rejected under does not
+        // affect validity, but keeping the order identical keeps a
+        // differential harness from reporting disagreements that are not.
+        if (tx.vin.size() != 1) {
+            error = BlockError::M6_INPUT_COUNT;
+            return false;
+        }
+        if (vout != 0) {
+            error = BlockError::M6_TREASURY_OUTPUT_INDEX;
+            return false;
+        }
+
+        M6Error m6_error{};
+        const std::optional<BlindedM6> blinded{BlindM6(tx, previous_value, m6_error)};
+        if (!blinded) {
+            // The structural checks above cover every way BlindM6 can fail
+            // except arithmetic, which means the outputs claim more than the
+            // treasury held.
+            error = BlockError::M6_UNKNOWN_BUNDLE;
+            return false;
+        }
+
+        const PendingWithdrawals* pending{state.GetPendingWithdrawals(slot)};
+        if (pending == nullptr) {
+            error = BlockError::STATE_MISMATCH;
+            return false;
+        }
+        uint32_t index{0};
+        const PendingWithdrawal* bundle{nullptr};
+        for (uint32_t i{0}; i < pending->size(); ++i) {
+            if ((*pending)[i].m6id == blinded->m6id) {
+                index = i;
+                bundle = &(*pending)[i];
+                break;
+            }
+        }
+        if (bundle == nullptr) {
+            error = BlockError::M6_UNKNOWN_BUNDLE;
+            return false;
+        }
+        if (!thresholds.BundleIsPayable(bundle->vote_count)) {
+            error = BlockError::M6_INSUFFICIENT_VOTES;
+            return false;
+        }
+
+        if (!deposits.ctips.empty()) {
+            error = BlockError::AMBIGUOUS_TREASURY_TX;
+            return false;
+        }
+        if (withdrawal) {
+            error = BlockError::M6_TREASURY_OUTPUT_COUNT;
+            return false;
+        }
+
+        withdrawal = M6Diff{
+            .slot = slot,
+            .ctip = change,
+            .removed_index = index,
+            .removed = *bundle,
+        };
+    }
+
+    if (withdrawal) {
+        out = *withdrawal;
+    } else if (!deposits.ctips.empty()) {
+        out = deposits;
+    }
+    return true;
 }
 
 } // namespace drivechain

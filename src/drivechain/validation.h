@@ -50,6 +50,28 @@ enum class BlockError {
     M4_VOTE_COUNT_MISMATCH,
     //! An M4 selecting a bundle position that does not exist in that slot.
     M4_BUNDLE_INDEX_OUT_OF_RANGE,
+    //! A transaction that satisfies both the deposit and the withdrawal rules.
+    AMBIGUOUS_TREASURY_TX,
+    //! A deposit without the address output that must follow the treasury.
+    MISSING_DEPOSIT_ADDRESS,
+    //! More than one treasury output for a slot in one transaction.
+    MULTIPLE_TREASURY_OUTPUTS,
+    //! A treasury output created for a slot whose treasury is still unspent.
+    OLD_CTIP_UNSPENT,
+    //! A treasury spent without creating a replacement for that slot.
+    TREASURY_SPENT_WITHOUT_NEW_CTIP,
+    //! A treasury moved to an equal value: neither deposit nor withdrawal.
+    ZERO_VALUE_CHANGE,
+    //! A withdrawal with more or fewer than one input.
+    M6_INPUT_COUNT,
+    //! A withdrawal whose treasury output is not at vout[0].
+    M6_TREASURY_OUTPUT_INDEX,
+    //! More than one withdrawal in a single transaction.
+    M6_TREASURY_OUTPUT_COUNT,
+    //! A withdrawal whose M6ID matches no pending bundle for the slot.
+    M6_UNKNOWN_BUNDLE,
+    //! A withdrawal whose bundle has not been approved by enough votes.
+    M6_INSUFFICIENT_VOTES,
     //! The state does not contain what a diff built against it expects. A bug
     //! or corruption, not a bad block.
     STATE_MISMATCH,
@@ -191,6 +213,28 @@ static constexpr uint16_t LEADING_BY_50_MARGIN{50};
                             const AckBundles& previous,
                             AckBundles& out,
                             BlockError& error);
+
+/**
+ * Handle a transaction that may move a sidechain treasury: M5 or M6.
+ *
+ * The two are told apart by arithmetic rather than by a tag. A transaction that
+ * creates a treasury output worth more than the one it spent is a deposit; one
+ * worth less is a withdrawal; one worth the same is neither, and invalid.
+ *
+ * `out` is left empty for a transaction that touches no treasury, which is
+ * almost all of them.
+ *
+ * These are the rules that hold the peg. `OP_DRIVECHAIN` evaluates true with an
+ * empty scriptSig, so to the script interpreter a treasury output is
+ * anyone-can-spend; nothing but these block-level rules stops it being taken.
+ *
+ * BIP-300, "M5 — Deposit", "M6 — Withdrawal", "Transaction validation".
+ */
+[[nodiscard]] bool HandleTreasuryTx(const CTransaction& tx,
+                                    const DrivechainState& state,
+                                    const Thresholds& thresholds,
+                                    std::optional<TxDiff>& out,
+                                    BlockError& error);
 
 } // namespace drivechain
 
