@@ -187,6 +187,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   blockfilter.cpp
   consensus/tx_verify.cpp
   dbwrapper.cpp
+  drivechain/db.cpp
   deploymentstatus.cpp
   flatfile.cpp
   headerssync.cpp

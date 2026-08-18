@@ -169,6 +169,12 @@ public:
 
     friend bool operator==(const DrivechainState& a, const DrivechainState& b) = default;
 
+    //! Written whole rather than entry by entry; see DrivechainDB.
+    SERIALIZE_METHODS(DrivechainState, obj)
+    {
+        READWRITE(obj.m_proposals, obj.m_active, obj.m_pending, obj.m_ctip);
+    }
+
 private:
     std::map<SidechainProposalId, Sidechain> m_proposals;
     std::map<SlotNum, Sidechain> m_active;
