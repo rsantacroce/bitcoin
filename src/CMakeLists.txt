@@ -62,8 +62,10 @@ add_library(bitcoin_consensus STATIC EXCLUDE_FROM_ALL
   arith_uint256.cpp
   consensus/merkle.cpp
   consensus/tx_check.cpp
+  drivechain/diff.cpp
   drivechain/m6id.cpp
   drivechain/messages.cpp
+  drivechain/state.cpp
   hash.cpp
   primitives/block.cpp
   primitives/transaction.cpp
@@ -185,6 +187,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   blockfilter.cpp
   consensus/tx_verify.cpp
   dbwrapper.cpp
+  drivechain/db.cpp
   deploymentstatus.cpp
   flatfile.cpp
   headerssync.cpp

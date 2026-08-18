@@ -43,6 +43,7 @@ add_executable(fuzz
   descriptor_parse.cpp
   deserialize.cpp
   difference_formatter.cpp
+  drivechain_diff.cpp
   eval_script.cpp
   feefrac.cpp
   fee_rate.cpp

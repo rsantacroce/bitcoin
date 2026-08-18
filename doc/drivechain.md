@@ -59,9 +59,12 @@ follows that split:
 |---|---|
 | `src/drivechain/messages.{h,cpp}` | wire formats: treasury and deposit scripts, M1–M4, M7, M8 |
 | `src/drivechain/m6id.{h,cpp}` | the blinded withdrawal transaction and its `M6ID` |
+| `src/drivechain/state.{h,cpp}` | D1 and D2, the two lists an enforcing node maintains |
+| `src/drivechain/diff.{h,cpp}` | what one block does to that state, and how to undo it |
+| `src/drivechain/db.{h,cpp}` | persistence for both |
 
-Later phases add the state layer, the script flag, connect-time validation,
-mempool policy and RPCs. This document grows with them.
+Later phases add the script flag, connect-time validation, mempool policy and
+RPCs. This document grows with them.
 
 Everything under `src/drivechain/` is new code; the diff against upstream files
 is deliberately kept to a handful of call sites so that the patchset stays
@@ -70,8 +73,9 @@ reviewable and rebases cleanly across Core releases.
 ## Reviewing
 
 Commits are small and ordered so each one builds and tests green on its own.
-Phase 1 (this series) is pure functions over bytes — no chain state, no database,
-nothing that can reject a block:
+
+**Phase 1** is pure functions over bytes — no chain state, no database, nothing
+that can reject a block:
 
 1. treasury and deposit output scripts
 2. BIP-300 coinbase messages (M1–M4)
@@ -82,6 +86,20 @@ The parsers are the foundation everything later stands on, and a mistake here
 misclassifies messages silently rather than failing loudly — which is why they
 land first, and alone.
 
+**Phase 2** is the state and how a block moves it. Still nothing that can reject
+a block:
+
+5. the sidechain and withdrawal state (D1, D2, treasury pointers)
+6. the per-block diff, with apply and undo
+7. serialization for the diff
+8. persistence for the state and the diffs
+9. a fuzz target over connect/disconnect sequences
+
+The invariant the phase exists to establish is that undoing a block restores the
+state exactly. Everything in Phase 4 depends on it, and a reorg that leaves the
+state subtly wrong would not be visible until a block is rejected hundreds of
+blocks later. That is why the fuzz target lands here rather than at the end.
+
 ## Notes for implementers
 
 **M7 and M8 are not parsed the same way, and the asymmetry is load-bearing.**
@@ -91,6 +109,12 @@ any valid encoding of the payload push is accepted. M8 is matched against a fixe
 `OP_PUSHDATA1` encoding of the same 68 payload bytes does not parse at all. A
 single generic parser for both is wrong, and wrong in a way that tests over
 well-formed messages will not catch.
+
+**The diff carries more than the change.** Vote counts saturate at zero and
+bundle positions are what an M4 votes by, so undo cannot recompute either from
+the state it is handed — it has to be told which bundles actually lost a vote and
+where in the list each one sat. Anything that looks like redundancy in
+`diff.h` is almost certainly this.
 
 **`OP_DRIVECHAIN` is `OP_NOP5`, and the treasury is anyone-can-spend to a node
 that does not enforce these rules.** The treasury script
