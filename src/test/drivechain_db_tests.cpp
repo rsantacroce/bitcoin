@@ -59,6 +59,7 @@ DrivechainState PopulatedState()
         .proposal_height = 250,
     });
     state.PutCtip(SLOT, Ctip{.outpoint = COutPoint{Txid::FromUint256(uint256{4}), 1}, .value = 21000});
+    state.SetBestBlock(uint256{42});
     return state;
 }
 } // namespace
@@ -69,39 +70,38 @@ BOOST_AUTO_TEST_CASE(fresh_database_has_no_state)
 {
     const auto db{MakeDB()};
     DrivechainState state;
-    uint256 tip;
-    BOOST_CHECK(!db->ReadState(state, tip));
+    BOOST_CHECK(!db->ReadState(state));
 }
 
 BOOST_AUTO_TEST_CASE(state_round_trips)
 {
     const auto db{MakeDB()};
     const DrivechainState written{PopulatedState()};
-    const uint256 tip{uint256{42}};
-    db->Flush(written, tip);
+    db->Flush(written);
 
     DrivechainState read;
-    uint256 read_tip;
-    BOOST_REQUIRE(db->ReadState(read, read_tip));
+    BOOST_REQUIRE(db->ReadState(read));
     BOOST_CHECK(read == written);
-    BOOST_CHECK(read_tip == tip);
+    // The state names the block it describes, so reading it back tells a node
+    // where it is without a second key that could disagree.
+    BOOST_CHECK(read.GetBestBlock() == uint256{42});
 }
 
 BOOST_AUTO_TEST_CASE(flush_replaces_the_previous_state)
 {
     const auto db{MakeDB()};
-    db->Flush(PopulatedState(), uint256{1});
+    db->Flush(PopulatedState());
 
     // Writing the state whole means a later flush cannot leave stale entries
     // from an earlier one behind.
-    const DrivechainState empty;
-    db->Flush(empty, uint256{2});
+    DrivechainState empty;
+    empty.SetBestBlock(uint256{2});
+    db->Flush(empty);
 
     DrivechainState read;
-    uint256 read_tip;
-    BOOST_REQUIRE(db->ReadState(read, read_tip));
+    BOOST_REQUIRE(db->ReadState(read));
     BOOST_CHECK(read == empty);
-    BOOST_CHECK(read_tip == uint256{2});
+    BOOST_CHECK(read.GetBestBlock() == uint256{2});
 }
 
 BOOST_AUTO_TEST_CASE(block_diffs_round_trip_and_can_be_dropped)
@@ -114,7 +114,7 @@ BOOST_AUTO_TEST_CASE(block_diffs_round_trip_and_can_be_dropped)
 
     std::map<uint256, BlockDiff> store;
     store[block_hash] = diff;
-    db->Flush(PopulatedState(), block_hash, store);
+    db->Flush(PopulatedState(), store);
 
     BlockDiff read;
     BOOST_REQUIRE(db->ReadBlockDiff(block_hash, read));
@@ -128,27 +128,33 @@ BOOST_AUTO_TEST_CASE(block_diffs_round_trip_and_can_be_dropped)
     BOOST_CHECK(!db->ReadBlockDiff(uint256{10}, read));
 
     // Pruning a diff the chain can no longer reorg through.
-    db->Flush(PopulatedState(), block_hash, {}, {block_hash});
+    db->Flush(PopulatedState(), {}, {block_hash});
     BOOST_CHECK(!db->ReadBlockDiff(block_hash, read));
 }
 
-BOOST_AUTO_TEST_CASE(state_and_tip_are_written_together)
+BOOST_AUTO_TEST_CASE(the_state_names_its_own_block)
 {
-    // The state is only meaningful alongside the block it reflects: without
-    // the tip there is no way to tell what still needs connecting. One batch
-    // carries both, so a reader can never see one without the other.
+    // The block a state describes travels inside it, so a reader can never
+    // find the two disagreeing: there is only one thing to read.
     const auto db{MakeDB()};
-    const DrivechainState written{PopulatedState()};
+    DrivechainState written{PopulatedState()};
 
-    db->Flush(written, uint256{1});
+    written.SetBestBlock(uint256{1});
+    db->Flush(written);
     DrivechainState read;
-    uint256 read_tip;
-    BOOST_REQUIRE(db->ReadState(read, read_tip));
-    BOOST_CHECK(read_tip == uint256{1});
+    BOOST_REQUIRE(db->ReadState(read));
+    BOOST_CHECK(read.GetBestBlock() == uint256{1});
 
-    db->Flush(written, uint256{2});
-    BOOST_REQUIRE(db->ReadState(read, read_tip));
-    BOOST_CHECK(read_tip == uint256{2});
+    written.SetBestBlock(uint256{2});
+    db->Flush(written);
+    BOOST_REQUIRE(db->ReadState(read));
+    BOOST_CHECK(read.GetBestBlock() == uint256{2});
+
+    // And two states that differ only in the block they describe are not equal,
+    // so the reorg invariant covers it like everything else.
+    DrivechainState other{read};
+    other.SetBestBlock(uint256{3});
+    BOOST_CHECK(!(other == read));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -170,15 +170,30 @@ public:
     void PutCtip(SlotNum slot, const Ctip& ctip);
     bool EraseCtip(SlotNum slot);
 
+    /**
+     * The block this state describes, or null before any block has been
+     * applied.
+     *
+     * A state without it cannot be used: there is no way to tell which blocks
+     * it has already seen, and applying one twice or undoing one it never saw
+     * both corrupt it silently. Connecting and disconnecting are therefore
+     * only meaningful when this names the right block, which is what lets a
+     * verification pass work on a scratch copy without disturbing the real one
+     * -- the same arrangement CCoinsViewCache has with GetBestBlock().
+     */
+    const uint256& GetBestBlock() const { return m_best_block; }
+    void SetBestBlock(const uint256& block_hash) { m_best_block = block_hash; }
+
     friend bool operator==(const DrivechainState& a, const DrivechainState& b) = default;
 
     //! Written whole rather than entry by entry; see DrivechainDB.
     SERIALIZE_METHODS(DrivechainState, obj)
     {
-        READWRITE(obj.m_proposals, obj.m_active, obj.m_pending, obj.m_ctip);
+        READWRITE(obj.m_best_block, obj.m_proposals, obj.m_active, obj.m_pending, obj.m_ctip);
     }
 
 private:
+    uint256 m_best_block;
     std::map<SidechainProposalId, Sidechain> m_proposals;
     std::map<SlotNum, Sidechain> m_active;
     std::map<SlotNum, PendingWithdrawals> m_pending;

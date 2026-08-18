@@ -18,6 +18,7 @@
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <cuckoocache.h>
+#include <drivechain/validation.h>
 #include <flatfile.h>
 #include <hash.h>
 #include <kernel/chainparams.h>
@@ -1929,6 +1930,30 @@ void Chainstate::InitCoinsDB(
             .options = m_chainman.m_options.coins_db},
         m_chainman.m_options.coins_view);
 
+    // Created here rather than beside its own call site so it cannot be
+    // created, wiped or opened out of step with the coins database. The handle
+    // is released first because a chainstate can be re-initialised, and two
+    // handles on one leveldb directory means the second cannot take the lock.
+    fs::path drivechain_path{StoragePath()};
+    drivechain_path += "_drivechain";
+    m_drivechain_db.reset();
+    m_drivechain_db = std::make_unique<drivechain::DrivechainDB>(DBParams{
+        .path = drivechain_path,
+        // The state is bounded by 256 slots holding a handful of entries each,
+        // so a larger cache would be several times the data.
+        .cache_bytes = 1 << 20,
+        .memory_only = in_memory,
+        .wipe_data = should_wipe,
+        .obfuscate = false,
+    });
+
+    // An empty state correctly describes the genesis block: no BIP300 activity
+    // can precede it. Saying so here means a chainstate that is never loaded
+    // from disk -- a brand new datadir -- still knows where it is, and the
+    // first block connected finds a state describing its parent.
+    m_drivechain_state = drivechain::DrivechainState{};
+    m_drivechain_state.SetBestBlock(m_chainman.GetParams().GenesisBlock().GetHash());
+
     m_coinsdb_cache_size_bytes = cache_size_bytes;
 }
 
@@ -2180,7 +2205,8 @@ int ApplyTxInUndo(Coin&& undo, CCoinsViewCache& view, const COutPoint& out)
 
 /** Undo the effects of this block (with given index) on the UTXO set represented by coins.
  *  When FAILED is returned, view is left in an indeterminate state. */
-DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
+DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view,
+                                             drivechain::DrivechainState& drivechain)
 {
     AssertLockHeld(::cs_main);
     bool fClean = true;
@@ -2245,6 +2271,31 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
         }
     }
 
+    // BIP300/BIP301: undo this block's effect on the sidechain state, but only
+    // when the state actually describes this block. A verification pass may
+    // hand us one that has never seen it, and undoing a block twice -- or one
+    // that was never applied -- corrupts the state silently.
+    if (drivechain.GetBestBlock() == pindex->GetBlockHash()) {
+        // Below the activation height a block changes nothing, so there is no
+        // diff to read and none was ever written; the state simply steps back.
+        if (pindex->nHeight < m_chainman.GetConsensus().drivechain_activation_height) {
+            drivechain.SetBestBlock(pindex->pprev->GetBlockHash());
+            view.SetBestBlock(pindex->pprev->GetBlockHash());
+            return fClean ? DISCONNECT_OK : DISCONNECT_UNCLEAN;
+        }
+        drivechain::BlockDiff diff;
+        if (!Assert(m_drivechain_db)->ReadBlockDiff(pindex->GetBlockHash(), diff)) {
+            LogError("DisconnectBlock(): no drivechain diff stored for %s\n", pindex->GetBlockHash().ToString());
+            return DISCONNECT_FAILED;
+        }
+        drivechain::UndoError undo_error{};
+        if (!diff.Undo(drivechain, undo_error)) {
+            LogError("DisconnectBlock(): failed to undo drivechain state for %s\n", pindex->GetBlockHash().ToString());
+            return DISCONNECT_FAILED;
+        }
+        drivechain.SetBestBlock(pindex->pprev->GetBlockHash());
+    }
+
     // move best block pointer to prevout block
     view.SetBestBlock(pindex->pprev->GetBlockHash());
 
@@ -2297,7 +2348,8 @@ script_verify_flags GetBlockScriptFlags(const CBlockIndex& block_index, const Ch
  *  Validity checks that depend on the UTXO set are also done; ConnectBlock()
  *  can fail if those validity checks fail (among other reasons). */
 bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
-                               CCoinsViewCache& view, bool fJustCheck)
+                               CCoinsViewCache& view, drivechain::DrivechainState& drivechain,
+                               drivechain::BlockDiff* drivechain_diff, bool fJustCheck)
 {
     AssertLockHeld(cs_main);
     assert(pindex);
@@ -2633,12 +2685,56 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
              Ticks<SecondsDouble>(m_chainman.time_verify),
              Ticks<MillisecondsDouble>(m_chainman.time_verify) / m_chainman.num_blocks_total);
 
+    // BIP300/BIP301. Every rule needs either accrued sidechain state or the
+    // value of a treasury output being spent, so none of it can be hoisted
+    // into CheckBlock: this is the earliest point at which it can be decided.
+    //
+    // Only when the state describes this block's parent. A verification pass
+    // may hand us one that does not, and a state that has not seen the parent
+    // is in no position to judge the child.
+    const uint256 drivechain_parent{pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{}};
+    drivechain::BlockDiff drivechain_block_diff;
+    const bool drivechain_current{drivechain.GetBestBlock() == drivechain_parent};
+    if (drivechain_current) {
+        drivechain::BlockContext context;
+        context.height = pindex->nHeight;
+        context.parent_hash = drivechain_parent;
+        // An M4 that repeats the previous block replays the votes that block
+        // resolved to, which its diff records rather than recomputes.
+        if (pindex->pprev) {
+            drivechain::BlockDiff previous;
+            if (Assert(m_drivechain_db)->ReadBlockDiff(drivechain_parent, previous)) {
+                context.previous_votes = drivechain::ResolvedVotes(previous);
+            }
+        }
+
+        const Consensus::Params& consensus{m_chainman.GetConsensus()};
+        drivechain::BlockError drivechain_error{};
+        if (!drivechain::ConnectBlock(block, context, drivechain, consensus.drivechain_thresholds,
+                                      consensus.drivechain_activation_height, drivechain_block_diff,
+                                      drivechain_error)) {
+            LogInfo("Block %s violates BIP300/BIP301: %s\n", block_hash.ToString(),
+                    drivechain::BlockErrorString(drivechain_error));
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
+                                 drivechain::BlockErrorString(drivechain_error));
+        }
+    }
+
     if (fJustCheck) {
         return true;
     }
 
     if (!m_blockman.WriteBlockUndo(blockundo, state, *pindex)) {
         return false;
+    }
+
+    if (drivechain_current) {
+        if (!drivechain_block_diff.Apply(drivechain, pindex->nHeight)) {
+            return FatalError(m_chainman.GetNotifications(), state,
+                              _("Drivechain state does not match the block being connected."));
+        }
+        drivechain.SetBestBlock(block_hash);
+        if (drivechain_diff != nullptr) *drivechain_diff = std::move(drivechain_block_diff);
     }
 
     const auto time_5{SteadyClock::now()};
@@ -2958,11 +3054,25 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
     {
         CCoinsViewCache view(&CoinsTip());
         assert(view.GetBestBlock() == pindexDelete->GetBlockHash());
-        if (DisconnectBlock(block, pindexDelete, view) != DISCONNECT_OK) {
+        const bool drivechain_undone{m_drivechain_state.GetBestBlock() == pindexDelete->GetBlockHash() &&
+                                     pindexDelete->nHeight >= m_chainman.GetConsensus().drivechain_activation_height};
+        if (DisconnectBlock(block, pindexDelete, view, m_drivechain_state) != DISCONNECT_OK) {
             LogError("DisconnectTip(): DisconnectBlock %s failed\n", pindexDelete->GetBlockHash().ToString());
             return false;
         }
         view.Flush(/*reallocate_cache=*/false); // local CCoinsViewCache goes out of scope
+
+        if (drivechain_undone) {
+            // The diff is dropped in the same batch that moves the state back,
+            // so there is never a stored diff for a block the state is not
+            // past.
+            try {
+                Assert(m_drivechain_db)->Flush(m_drivechain_state, {}, {pindexDelete->GetBlockHash()});
+            } catch (const std::runtime_error& e) {
+                LogError("DisconnectTip(): system error while writing drivechain state: %s\n", e.what());
+                return false;
+            }
+        }
     }
     LogDebug(BCLog::BENCH, "- Disconnect block: %.2fms\n",
              Ticks<MillisecondsDouble>(SteadyClock::now() - time_start));
@@ -3081,7 +3191,27 @@ bool Chainstate::ConnectTip(
     {
         CCoinsViewCache& view{*m_coins_views->m_connect_block_view};
         const auto reset_guard{view.CreateResetGuard()};
-        bool rv = ConnectBlock(*block_to_connect, state, pindexNew, view);
+        drivechain::BlockDiff drivechain_diff;
+        bool rv = ConnectBlock(*block_to_connect, state, pindexNew, view, m_drivechain_state, &drivechain_diff);
+        // Only when the state actually took this block on, and only from the
+        // activation height. A chainstate that is not tracking BIP300 -- one
+        // loaded from a UTXO snapshot -- must not write a state describing no
+        // block, which is unusable on reload; and below the activation height
+        // there is nothing to record, so a node syncing a chain whose rules
+        // have not started pays nothing for them.
+        if (rv && m_drivechain_state.GetBestBlock() == pindexNew->GetBlockHash() &&
+            pindexNew->nHeight >= m_chainman.GetConsensus().drivechain_activation_height) {
+            // The state and the diff that undoes it go to disk in one batch,
+            // so a reader can never find a state describing a block whose undo
+            // data is missing -- which would be a block that cannot be
+            // disconnected.
+            try {
+                Assert(m_drivechain_db)->Flush(m_drivechain_state, {{pindexNew->GetBlockHash(), drivechain_diff}});
+            } catch (const std::runtime_error& e) {
+                return FatalError(m_chainman.GetNotifications(), state,
+                                  strprintf(_("System error while writing drivechain state: %s"), e.what()));
+            }
+        }
         if (m_chainman.m_options.signals) {
             m_chainman.m_options.signals->BlockChecked(block_to_connect, state);
         }
@@ -4570,7 +4700,11 @@ BlockValidationState TestBlockValidity(
     CCoinsViewCache view_dummy(&chainstate.CoinsTip());
 
     // Set fJustCheck to true in order to update, and not clear, validation caches.
-    if(!chainstate.ConnectBlock(block, state, &index_dummy, view_dummy, /*fJustCheck=*/true)) {
+    // A scratch copy, so testing a candidate block cannot disturb the state
+    // the chain is actually on.
+    drivechain::DrivechainState drivechain_dummy{chainstate.DrivechainTip()};
+    if(!chainstate.ConnectBlock(block, state, &index_dummy, view_dummy, drivechain_dummy,
+                                /*drivechain_diff=*/nullptr, /*fJustCheck=*/true)) {
         if (state.IsValid()) NONFATAL_UNREACHABLE();
         return state;
     }
@@ -4591,6 +4725,80 @@ void PruneBlockFilesManual(Chainstate& active_chainstate, int nManualPruneHeight
     }
 }
 
+bool Chainstate::LoadDrivechainState()
+{
+    AssertLockHeld(cs_main);
+    Assert(m_drivechain_db);
+
+    const CBlockIndex* tip{m_chain.Tip()};
+    if (tip == nullptr) return true;
+
+    // A chainstate loaded from a UTXO snapshot has no history to replay and no
+    // stored diffs, and the snapshot carries no sidechain state of its own, so
+    // there is nothing this state could be derived from. Leaving it empty --
+    // and, crucially, describing no block -- means every BIP300 rule is
+    // skipped on this chainstate, which is the only honest thing it can do:
+    // its blocks are validated for real by the background chainstate, which
+    // does have the history.
+    if (m_from_snapshot_blockhash) {
+        // Describing no block at all is what turns every BIP300 rule off on
+        // this chainstate, which is the only honest thing it can do.
+        m_drivechain_state = drivechain::DrivechainState{};
+        LogWarning("BIP300/BIP301 rules are not enforced on a chainstate loaded from a UTXO snapshot. "
+                   "They are enforced by the background chainstate as it catches up.\n");
+        return true;
+    }
+
+    drivechain::DrivechainState state;
+    if (!m_drivechain_db->ReadState(state)) {
+        // Nothing written yet: a fresh datadir, one whose chainstate was
+        // wiped, or one that predates these rules. An empty state is the right
+        // answer for any block below the activation height, since no BIP300
+        // activity can have happened yet -- which is also what lets an
+        // existing node upgrade without reindexing, as long as it upgrades
+        // before the rules take effect.
+        const int activation{m_chainman.GetConsensus().drivechain_activation_height};
+        const CBlockIndex* start{tip->nHeight < activation ? tip : m_chain[0]};
+        state.SetBestBlock(start->GetBlockHash());
+    }
+
+    const CBlockIndex* stored{m_blockman.LookupBlockIndex(state.GetBestBlock())};
+    if (stored == nullptr || !m_chain.Contains(stored)) {
+        LogError("Drivechain state describes block %s, which is not in the active chain. "
+                 "Rebuild with -reindex-chainstate.\n",
+                 state.GetBestBlock().ToString());
+        return false;
+    }
+
+    // Catch up on blocks the state has not seen. The coins database is allowed
+    // to lag the chain and is replayed forward the same way; this is the
+    // sidechain state's equivalent, and it is why each block's diff is written
+    // as that block connects rather than only when the state is flushed.
+    for (int height{stored->nHeight + 1}; height <= m_chain.Height(); ++height) {
+        const CBlockIndex* pindex{m_chain[height]};
+        drivechain::BlockDiff diff;
+        if (!m_drivechain_db->ReadBlockDiff(pindex->GetBlockHash(), diff)) {
+            LogError("No drivechain diff stored for block %s at height %d. "
+                     "Rebuild with -reindex-chainstate.\n",
+                     pindex->GetBlockHash().ToString(), height);
+            return false;
+        }
+        if (!diff.Apply(state, height)) {
+            LogError("Drivechain diff for block %s does not apply. "
+                     "Rebuild with -reindex-chainstate.\n",
+                     pindex->GetBlockHash().ToString());
+            return false;
+        }
+        state.SetBestBlock(pindex->GetBlockHash());
+    }
+
+    if (stored->nHeight < m_chain.Height()) {
+        LogInfo("Replayed drivechain state from height %d to %d", stored->nHeight, m_chain.Height());
+    }
+    m_drivechain_state = std::move(state);
+    return true;
+}
+
 bool Chainstate::LoadChainTip()
 {
     AssertLockHeld(cs_main);
@@ -4599,7 +4807,7 @@ bool Chainstate::LoadChainTip()
     CBlockIndex* tip = m_chain.Tip();
 
     if (tip && tip->GetBlockHash() == coins_cache.GetBestBlock()) {
-        return true;
+        return LoadDrivechainState();
     }
 
     // Load pointer to end of best chain
@@ -4642,7 +4850,7 @@ bool Chainstate::LoadChainTip()
 
     CheckForkWarningConditions();
 
-    return true;
+    return LoadDrivechainState();
 }
 
 CVerifyDB::CVerifyDB(Notifications& notifications)
@@ -4675,6 +4883,11 @@ VerifyDBResult CVerifyDB::VerifyDB(
     nCheckLevel = std::max(0, std::min(4, nCheckLevel));
     LogInfo("Verifying last %i blocks at level %i", nCheckDepth, nCheckLevel);
     CCoinsViewCache coins(&coinsview);
+    // A scratch copy, so verifying does not disturb the state the chain is on.
+    // It starts where the chain is, which is what lets the rollback below undo
+    // blocks at all; once it has been rolled back past a block the copy no
+    // longer describes, the drivechain work simply stops, as it should.
+    drivechain::DrivechainState drivechain{chainstate.DrivechainTip()};
     CBlockIndex* pindex;
     CBlockIndex* pindexFailure = nullptr;
     int nGoodTransactions = 0;
@@ -4732,7 +4945,7 @@ VerifyDBResult CVerifyDB::VerifyDB(
         if (nCheckLevel >= 3) {
             if (curr_coins_usage <= chainstate.m_coinstip_cache_size_bytes) {
                 assert(coins.GetBestBlock() == pindex->GetBlockHash());
-                DisconnectResult res = chainstate.DisconnectBlock(block, pindex, coins);
+                DisconnectResult res = chainstate.DisconnectBlock(block, pindex, coins, drivechain);
                 if (res == DISCONNECT_FAILED) {
                     LogError("Verification error: irrecoverable inconsistency in block data at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
                     return VerifyDBResult::CORRUPTED_BLOCK_DB;
@@ -4776,7 +4989,7 @@ VerifyDBResult CVerifyDB::VerifyDB(
                 LogError("Verification error: ReadBlock failed at %d, hash=%s", pindex->nHeight, pindex->GetBlockHash().ToString());
                 return VerifyDBResult::CORRUPTED_BLOCK_DB;
             }
-            if (!chainstate.ConnectBlock(block, state, pindex, coins)) {
+            if (!chainstate.ConnectBlock(block, state, pindex, coins, drivechain)) {
                 LogError("Verification error: found unconnectable block at %d, hash=%s (%s)", pindex->nHeight, pindex->GetBlockHash().ToString(), state.ToString());
                 return VerifyDBResult::CORRUPTED_BLOCK_DB;
             }
@@ -4824,6 +5037,10 @@ bool Chainstate::ReplayBlocks()
 
     CCoinsView& db = this->CoinsDB();
     CCoinsViewCache cache(&db);
+    // Replaying catches the coins database up with blocks it has already been
+    // told about. The drivechain state is caught up separately, by
+    // LoadDrivechainState, so this copy is a scratch one.
+    drivechain::DrivechainState drivechain{m_drivechain_state};
 
     std::vector<uint256> hashHeads = db.GetHeadBlocks();
     if (hashHeads.empty()) return true; // We're already in a consistent state.
@@ -4869,7 +5086,7 @@ bool Chainstate::ReplayBlocks()
                 if (pindexOld->nHeight % 10'000 == 0) {
                     LogInfo("Rolling back %s (%i)", pindexOld->GetBlockHash().ToString(), pindexOld->nHeight);
                 }
-                DisconnectResult res = DisconnectBlock(block, pindexOld, cache);
+                DisconnectResult res = DisconnectBlock(block, pindexOld, cache, drivechain);
                 if (res == DISCONNECT_FAILED) {
                     LogError("RollbackBlock(): DisconnectBlock failed at %d, hash=%s\n", pindexOld->nHeight, pindexOld->GetBlockHash().ToString());
                     return false;

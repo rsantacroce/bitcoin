@@ -14,6 +14,7 @@
 #include <consensus/amount.h>
 #include <cuckoocache.h>
 #include <deploymentstatus.h>
+#include <drivechain/db.h>
 #include <kernel/chain.h>
 #include <kernel/chainparams.h>
 #include <kernel/chainstatemanager_opts.h>
@@ -564,6 +565,14 @@ protected:
     //! Manages the UTXO set, which is a reflection of the contents of `m_chain`.
     std::unique_ptr<CoinsViews> m_coins_views;
 
+    //! BIP300/BIP301 state, and where it is kept.
+    //!
+    //! Created, wiped and released with the coins database, because the two
+    //! describe the same tip and a node that found them at different heights
+    //! would have no way to tell which to believe.
+    std::unique_ptr<drivechain::DrivechainDB> m_drivechain_db;
+    drivechain::DrivechainState m_drivechain_state GUARDED_BY(::cs_main);
+
     //! Cached result of LookupBlockIndex(*m_from_snapshot_blockhash)
     mutable const CBlockIndex* m_cached_snapshot_base GUARDED_BY(::cs_main){nullptr};
 
@@ -611,6 +620,22 @@ public:
     //! Initialize the in-memory coins cache (to be done after the health of the on-disk database
     //! is verified).
     void InitCoinsCache(size_t cache_size_bytes) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    //! The BIP300/BIP301 state as of this chainstate's tip. Named to parallel
+    //! CoinsTip(), since it is the same kind of thing.
+    drivechain::DrivechainState& DrivechainTip() EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+    {
+        AssertLockHeld(::cs_main);
+        return m_drivechain_state;
+    }
+
+    //! Bring the BIP300/BIP301 state up to the chain tip, reading it from disk
+    //! and replaying any blocks it has not yet seen.
+    //!
+    //! Returns false if that is not possible, which means the stored state and
+    //! the block index disagree beyond repair and the chainstate must be
+    //! rebuilt.
+    [[nodiscard]] bool LoadDrivechainState() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! @returns whether or not the CoinsViews object has been fully initialized and we can
     //!          safely flush this object to disk.
@@ -712,7 +737,12 @@ public:
     }
 
     //! Destructs all objects related to accessing the UTXO set.
-    void ResetCoinsViews() { m_coins_views.reset(); }
+    void ResetCoinsViews()
+    {
+        m_coins_views.reset();
+        // Released with the coins views, since they are created together.
+        m_drivechain_db.reset();
+    }
 
     //! The cache size of the on-disk coins view.
     size_t m_coinsdb_cache_size_bytes{0};
@@ -776,10 +806,12 @@ public:
         LOCKS_EXCLUDED(::cs_main);
 
     // Block (dis)connection on a given view:
-    DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
+    DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view,
+                                     drivechain::DrivechainState& drivechain)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
-                      CCoinsViewCache& view, bool fJustCheck = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+                      CCoinsViewCache& view, drivechain::DrivechainState& drivechain,
+                      drivechain::BlockDiff* drivechain_diff = nullptr, bool fJustCheck = false) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     // Apply the effects of a block disconnection on the UTXO set.
     bool DisconnectTip(BlockValidationState& state, DisconnectedBlockTransactions* disconnectpool) EXCLUSIVE_LOCKS_REQUIRED(cs_main, m_mempool->cs);

@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chainparams.h>
+#include <drivechain/state.h>
 #include <index/coinstatsindex.h>
 #include <interfaces/chain.h>
 #include <kernel/coinstats.h>
@@ -91,7 +92,8 @@ BOOST_FIXTURE_TEST_CASE(coinstatsindex_unclean_shutdown, TestChain100Setup)
             BOOST_CHECK(CheckBlock(block, state, params.GetConsensus()));
             BOOST_CHECK(m_node.chainman->AcceptBlock(new_block, state, &new_block_index, true, nullptr, nullptr, true));
             CCoinsViewCache view(&chainstate.CoinsTip());
-            BOOST_CHECK(chainstate.ConnectBlock(block, state, new_block_index, view));
+            drivechain::DrivechainState drivechain{chainstate.DrivechainTip()};
+            BOOST_CHECK(chainstate.ConnectBlock(block, state, new_block_index, view, drivechain));
         }
         // Send block connected notification, then stop the index without
         // sending a chainstate flushed notification. Prior to #24138, this
