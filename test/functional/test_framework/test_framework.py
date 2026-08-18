@@ -949,7 +949,10 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
 
             os.rmdir(cache_path('wallets'))  # Remove empty wallets dir
             for entry in os.listdir(cache_path()):
-                if entry not in ['chainstate', 'blocks', 'indexes']:  # Only indexes, chainstate and blocks folders
+                # The drivechain database belongs to the chainstate and has to
+                # travel with it: a cached chainstate whose sidechain state was
+                # thrown away cannot be disconnected.
+                if entry not in ['chainstate', 'chainstate_drivechain', 'blocks', 'indexes']:
                     os.remove(cache_path(entry))
 
         for i in range(self.num_nodes):
