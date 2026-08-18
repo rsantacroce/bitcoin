@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 
 //! The vote counts and ages BIP-300 measures proposals and bundles against.
 //!
@@ -14,6 +15,15 @@
 //! consensus/params.h carries a copy, and that header is included nearly
 //! everywhere.
 namespace drivechain {
+
+//! Activation height meaning BIP-300 is not deployed on this network.
+//!
+//! Every network but regtest carries this today. Choosing a mainnet activation
+//! is a deployment decision nobody has made: BIP-300 says it deploys "when/if a
+//! majority of hashrate runs the enforcer client", which is a signalling
+//! mechanism rather than a height, and picking one here would be inventing an
+//! answer.
+inline constexpr int NOT_DEPLOYED{std::numeric_limits<int>::max()};
 
 /**
  * BIP-300's constants, and the comparisons made against them.

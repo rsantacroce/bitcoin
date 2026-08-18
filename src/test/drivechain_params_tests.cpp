@@ -2,6 +2,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparams.h>
 #include <drivechain/params.h>
 #include <test/util/setup_common.h>
 
@@ -97,6 +98,32 @@ BOOST_AUTO_TEST_CASE(test_presets_keep_the_same_shape)
         BOOST_CHECK(thresholds.BundleIsPayable(thresholds.withdrawal_bundle_inclusion_threshold + 1));
         BOOST_CHECK(!thresholds.BundleExpired(thresholds.withdrawal_bundle_inclusion_threshold + 1));
     }
+}
+
+BOOST_AUTO_TEST_CASE(only_regtest_activates_by_default)
+{
+    // Choosing a mainnet activation is a deployment decision nobody has made:
+    // BIP-300 says it deploys "when/if a majority of hashrate runs the
+    // enforcer client", which is a signalling mechanism rather than a height.
+    // Until that is settled, the rules are off everywhere a real chain lives.
+    BOOST_CHECK_EQUAL(CChainParams::Main()->GetConsensus().drivechain_activation_height, drivechain::NOT_DEPLOYED);
+    BOOST_CHECK_EQUAL(CChainParams::TestNet()->GetConsensus().drivechain_activation_height, drivechain::NOT_DEPLOYED);
+    BOOST_CHECK_EQUAL(CChainParams::TestNet4()->GetConsensus().drivechain_activation_height, drivechain::NOT_DEPLOYED);
+    BOOST_CHECK_EQUAL(CChainParams::SigNet({})->GetConsensus().drivechain_activation_height, drivechain::NOT_DEPLOYED);
+
+    // Regtest is where the functional tests live, so it is on from genesis
+    // with the short thresholds that make a whole cycle take seconds.
+    const auto regtest{CChainParams::RegTest({})};
+    BOOST_CHECK_EQUAL(regtest->GetConsensus().drivechain_activation_height, 0);
+    BOOST_CHECK(regtest->GetConsensus().drivechain_thresholds == SHORT_THRESHOLDS);
+}
+
+BOOST_AUTO_TEST_CASE(mainnet_carries_the_specified_thresholds)
+{
+    // Stated even though the rules are off, so that turning them on is a
+    // one-line change rather than an invitation to invent constants.
+    const auto mainnet{CChainParams::Main()};
+    BOOST_CHECK(mainnet->GetConsensus().drivechain_thresholds == MAINNET_THRESHOLDS);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

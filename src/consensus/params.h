@@ -6,6 +6,7 @@
 #ifndef BITCOIN_CONSENSUS_PARAMS_H
 #define BITCOIN_CONSENSUS_PARAMS_H
 
+#include <drivechain/params.h>
 #include <script/verify_flags.h>
 #include <uint256.h>
 
@@ -107,6 +108,15 @@ struct Params {
     /** Don't warn about unknown BIP 9 activations below this height.
      * This prevents us from warning about the CSV and segwit activations. */
     int MinBIP9WarningHeight;
+    /** Block height at which BIP300/BIP301 become active, or
+     * drivechain::NOT_DEPLOYED. Blocks below it are plain Bitcoin history:
+     * recorded, but never scanned for BIP300/BIP301 messages or deposits. */
+    int drivechain_activation_height;
+    /** Vote counts and ages BIP300 measures proposals and bundles against.
+     * Non-mainnet networks substitute shorter values so that a full activation
+     * and withdrawal cycle is testable; the values are consensus-relevant per
+     * network and every enforcing node on that network must agree on them. */
+    drivechain::Thresholds drivechain_thresholds;
     std::array<BIP9Deployment,MAX_VERSION_BITS_DEPLOYMENTS> vDeployments;
     /** Proof of work parameters */
     uint256 powLimit;
