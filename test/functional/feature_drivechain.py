@@ -11,11 +11,14 @@ against a node that is enforcing and one that is not, since the whole point of
 the design is that the second still accepts everything the first does.
 """
 
-from test_framework.blocktools import create_block, create_coinbase
-from test_framework.messages import CTxOut, hash256
-from test_framework.script import CScript, OP_RETURN
+import copy
+
+from test_framework.blocktools import add_witness_commitment, create_block, create_coinbase
+from test_framework.messages import COIN, COutPoint, CTransaction, CTxIn, CTxInWitness, CTxOut, hash256
+from test_framework.script import CScript, OP_NOP5, OP_RETURN, OP_TRUE
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
+from test_framework.wallet import MiniWallet
 
 M1_TAG = b"\xd5\xe0\xc4\xaf"
 M4_TAG = b"\xd7\x7d\x17\x76"
@@ -35,6 +38,41 @@ def message_output(tag, body):
     return CTxOut(0, CScript([OP_RETURN, tag + body]))
 
 
+def treasury_script(slot):
+    """The scriptPubKey of a sidechain treasury: OP_DRIVECHAIN <slot> OP_TRUE.
+
+    Built byte by byte rather than through CScript, because the slot is a raw
+    unsigned byte and a script-number encoding would get three quarters of the
+    range wrong.
+    """
+    return CScript(bytes([OP_NOP5, 0x01, slot, OP_TRUE]))
+
+
+def address_output():
+    """The opaque sidechain address a deposit must carry after its treasury."""
+    return CTxOut(0, CScript([OP_RETURN, b"\xab\xcd"]))
+
+
+def blinded_m6id(tx, treasury_spent):
+    """The M6ID miners vote on, which is the txid of the blinded withdrawal.
+
+    An independent implementation of the rule, written from BIP-300 rather than
+    from the C++: empty the inputs, and replace the treasury change at vout[0]
+    with a zero-value OP_RETURN carrying the fee as eight bytes big-endian. If
+    this disagrees with the node, one of the two is wrong.
+    """
+    payouts = sum(out.nValue for out in tx.vout[1:])
+    fee = treasury_spent - tx.vout[0].nValue - payouts
+    assert fee >= 0
+
+    blinded = copy.deepcopy(tx)
+    blinded.vin = []
+    blinded.wit.vtxinwit = []
+    blinded.vout[0] = CTxOut(0, CScript([OP_RETURN, fee.to_bytes(8, "big")]))
+    # Internal byte order, which is what the wire carries.
+    return bytes.fromhex(blinded.txid_hex)[::-1]
+
+
 class DrivechainTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 2
@@ -46,6 +84,31 @@ class DrivechainTest(BitcoinTestFramework):
             [],
         ]
 
+    def deposit_tx(self, slot, amount, with_address=True, spend_treasury=None):
+        """A transaction moving `amount` into a sidechain treasury."""
+        utxo = self.wallet.get_utxo()
+        funded = self.wallet.create_self_transfer_multi(utxos_to_spend=[utxo], num_outputs=1)["tx"]
+        change = int(utxo["value"] * COIN) - amount - 1000
+        if spend_treasury is not None:
+            # A later deposit must also spend the treasury it replaces, and the
+            # new treasury holds both.
+            amount += spend_treasury[1]
+
+        funded.vout = [CTxOut(amount, treasury_script(slot))]
+        if with_address:
+            funded.vout.append(address_output())
+        funded.vout.append(CTxOut(change, self.wallet.get_output_script()))
+        self.wallet.sign_tx(funded)
+
+        if spend_treasury is not None:
+            # Added after signing, and with an empty witness: a treasury output
+            # is anyone-can-spend, so it takes neither signature nor witness,
+            # and giving it one makes the script check fail before any of the
+            # BIP300 rules are reached.
+            funded.vin.append(CTxIn(spend_treasury[0]))
+            funded.wit.vtxinwit.append(CTxInWitness())
+        return funded
+
     def build_block(self, extra_coinbase_outputs=None, extra_txs=None):
         tip = self.nodes[0].getbestblockhash()
         height = self.nodes[0].getblockcount() + 1
@@ -55,7 +118,9 @@ class DrivechainTest(BitcoinTestFramework):
             block.vtx[0].vout.append(output)
         for tx in extra_txs or []:
             block.vtx.append(tx)
-        block.hashMerkleRoot = block.calc_merkle_root()
+        # The wallet's transactions carry witnesses, so the coinbase needs the
+        # commitment. It appends an output, which the message rules ignore.
+        add_witness_commitment(block)
         block.solve()
         return block
 
@@ -191,13 +256,98 @@ class DrivechainTest(BitcoinTestFramework):
         self.log.info("Bundles for an empty slot cannot be listed")
         assert_raises_rpc_error(-8, "No sidechain is active in that slot", node.listwithdrawalbundles, 9)
 
+        self.log.info("Coins can be deposited into the sidechain treasury")
+        self.wallet = MiniWallet(node)
+        # Mined to the wallet's own script, so it has something to spend.
+        self.generate(self.wallet, 101)
+
+        deposit = self.deposit_tx(slot=0, amount=10 * COIN)
+        block = self.build_block(extra_txs=[deposit])
+        assert_equal(node.submitblock(block.serialize().hex()), None)
+
+        treasury = node.listsidechains()[0]["treasury"]
+        assert_equal(treasury["txid"], deposit.txid_hex)
+        assert_equal(treasury["vout"], 0)
+        assert_equal(int(treasury["amount"] * COIN), 10 * COIN)
+        self.sync_blocks()
+
+        self.log.info("A deposit without its address output invalidates the block")
+        bad = self.deposit_tx(
+            slot=0,
+            amount=1 * COIN,
+            with_address=False,
+            spend_treasury=(COutPoint(int(deposit.txid_hex, 16), 0), 10 * COIN),
+        )
+        self.assert_rejected(self.build_block(extra_txs=[bad]), "bad-drivechain-missing-deposit-address")
+
+        self.log.info("Taking the treasury without putting one back invalidates the block")
+        theft = self.wallet.create_self_transfer_multi(
+            utxos_to_spend=[self.wallet.get_utxo()], num_outputs=1
+        )["tx"]
+        theft.vin = [CTxIn(COutPoint(int(deposit.txid_hex, 16), 0))]
+        theft.wit.vtxinwit = []
+        theft.vout = [CTxOut(10 * COIN - 1000, self.wallet.get_output_script())]
+        self.assert_rejected(
+            self.build_block(extra_txs=[theft]), "bad-drivechain-treasury-spent-without-replacement"
+        )
+
+        self.log.info("A withdrawal needs a bundle the miners voted for")
+        withdrawal = CTransaction()
+        withdrawal.version = 2
+        withdrawal.vin = [CTxIn(COutPoint(int(deposit.txid_hex, 16), 0))]
+        withdrawal.vout = [
+            CTxOut(6 * COIN, treasury_script(0)),
+            CTxOut(3 * COIN, self.wallet.get_output_script()),
+        ]
+        m6id = blinded_m6id(withdrawal, 10 * COIN)
+
+        # Not proposed at all.
+        self.assert_rejected(
+            self.build_block(extra_txs=[withdrawal]), "bad-drivechain-m6-unknown-bundle"
+        )
+
+        block = self.build_block([message_output(M3_TAG, bytes([0]) + m6id)])
+        assert_equal(node.submitblock(block.serialize().hex()), None)
+        bundles = node.listwithdrawalbundles(0)
+        # The node computed the same M6ID from the same transaction, which is
+        # what makes the vote a commitment to these payouts and this fee.
+        assert_equal(bundles[-1]["m6id"], m6id[::-1].hex())
+        assert_equal(bundles[-1]["vote_count"], 1)
+
+        # Proposed but not yet approved.
+        self.assert_rejected(
+            self.build_block(extra_txs=[withdrawal]), "bad-drivechain-m6-insufficient-votes"
+        )
+
+        self.log.info("Voting the bundle past the threshold makes it payable")
+        index = len(node.listwithdrawalbundles(0)) - 1
+        while not node.listwithdrawalbundles(0)[index]["payable"]:
+            block = self.build_block([message_output(M4_TAG, bytes([0x01, index]))])
+            assert_equal(node.submitblock(block.serialize().hex()), None)
+        assert_equal(node.listwithdrawalbundles(0)[index]["vote_count"], ACTIVATION_THRESHOLD + 1)
+
+        self.log.info("The approved withdrawal pays out")
+        block = self.build_block(extra_txs=[withdrawal])
+        assert_equal(node.submitblock(block.serialize().hex()), None)
+
+        treasury = node.listsidechains()[0]["treasury"]
+        assert_equal(treasury["txid"], withdrawal.txid_hex)
+        assert_equal(int(treasury["amount"] * COIN), 6 * COIN)
+        # Paid out, so no longer pending.
+        assert_equal(node.listwithdrawalbundles(0), [])
+        self.sync_blocks()
+
         self.log.info("The state survives a restart")
         tip = node.getbestblockhash()
         self.restart_node(0, self.extra_args[0])
         assert_equal(node.getbestblockhash(), tip)
-        # What was voted in is still voted in.
-        assert_equal(len(node.listsidechains()), 1)
-        assert_equal(len(node.listwithdrawalbundles(0)), 1)
+        # What was voted in is still voted in, and the treasury is where the
+        # withdrawal left it.
+        sidechains = node.listsidechains()
+        assert_equal(len(sidechains), 1)
+        assert_equal(sidechains[0]["description"], description.hex())
+        assert_equal(int(sidechains[0]["treasury"]["amount"] * COIN), 6 * COIN)
+        assert_equal(node.listwithdrawalbundles(0), [])
         self.generate(node, 1, sync_fun=self.no_op)
 
 

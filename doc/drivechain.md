@@ -64,19 +64,45 @@ follows that split:
 | `src/drivechain/db.{h,cpp}` | persistence for both |
 | `src/drivechain/params.{h,cpp}` | thresholds and activation, per network |
 | `src/drivechain/validation.{h,cpp}` | the rules a block must satisfy |
-
 | `src/rpc/drivechain.cpp` | read-only calls reporting the state |
 
 The chainstate owns a `DrivechainDB` beside its coins database, and
 `ConnectBlock` and `DisconnectBlock` take the sidechain state the way they take
 the coins view.
 
-What is still missing: the deposit sequence index and the two RPCs that read it,
-and a differential harness against the reference implementation.
+What is still missing: the deposit sequence index and the two RPCs that read it.
 
 Everything under `src/drivechain/` is new code; the diff against upstream files
 is deliberately kept to a handful of call sites so that the patchset stays
 reviewable and rebases cleanly across Core releases.
+
+## Dependencies
+
+**None.** `bitcoind` and `test_bitcoin` build and pass with no part of the
+drivechain ecosystem present, and no Rust toolchain installed.
+
+That is worth stating explicitly because the reference implementation is cited
+throughout this patchset, and a reader could reasonably wonder whether any of it
+is load-bearing at build or run time. It is not:
+
+- Everything in `src/drivechain/` includes Bitcoin Core headers and the C++
+  standard library, and nothing else.
+- The reference implementation is named only in comments, explaining why a rule
+  is what it is.
+- The build system does not reference `contrib/`, and never invokes `cargo`.
+- The differential test reads `src/test/data/drivechain_vectors.json`, a
+  committed data file, through the same mechanism Core already uses for
+  `script_tests.json` and `sighash.json`. It is data, not a dependency.
+
+The one place the reference implementation is used is
+`contrib/drivechain-vectors`, a standalone tool that regenerates that data file.
+Nothing builds it and nothing links it. Delete the directory and the node and its
+entire test suite still build and pass; the only thing lost is the ability to
+refresh the vectors.
+
+The direction of the arrow matters here. This implementation is checked *against*
+the reference implementation. It does not depend *on* it, and there is no code
+path, include, or build rule by which it could start to.
 
 ## Reviewing
 
@@ -115,9 +141,10 @@ blocks later. That is why the fuzz target lands here rather than at the end.
 12. relaying spends of treasury outputs
 13. relaying creation of treasury outputs
 
-Only regtest activates. Choosing a mainnet activation is a deployment decision
+Nothing activates by default. Choosing an activation is a deployment decision
 nobody has made, and inventing a height here would be answering a question that
-has not been asked.
+has not been asked. Phase 5 makes regtest opt in with
+`-testactivationheight=drivechain@N`.
 
 **Phase 4** is the rule set: all 24 conditions under which a block is invalid,
 and the state transitions that go with them.
@@ -164,6 +191,21 @@ rather than guessed at.
 A chainstate loaded from a UTXO snapshot describes no block, so these rules are
 not enforced on it: it has no history to derive the state from and the snapshot
 carries none. Its blocks are validated by the background chainstate, which does.
+
+**Phase 7** is proving it, from two directions at once.
+
+29. differential vectors generated from the reference implementation
+30. a functional test that deposits into a treasury and withdraws from it
+
+The vectors say what the deployed enforcer decides; the functional test says
+that coins actually move. Between them they cover the two ways this could be
+wrong: disagreeing with the implementation it has to match, and agreeing with it
+while not working.
+
+The functional test computes the `M6ID` independently, from the specification
+rather than from the C++, and asserts the node arrives at the same identifier
+from the same transaction. That is a third implementation of the rule agreeing
+with the other two.
 
 **Phase 6** is mempool policy and the RPC surface.
 

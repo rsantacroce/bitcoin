@@ -1,0 +1,34 @@
+# Copyright (c) The Bitcoin Core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://www.opensource.org/licenses/mit-license.php.
+
+[package]
+name = "drivechain-vectors"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+# The reference implementation of BIP-300/301, which is the authority these
+# vectors record. Pin it: a vector file is only meaningful alongside the
+# revision that produced it.
+bip300301_enforcer_lib = { git = "https://github.com/LayerTwo-Labs/bip300301_enforcer.git" }
+bitcoin = "0.32.100"
+hex = "0.4"
+serde_json = "1"
+
+# The reference implementation patches these, and a `[patch]` only applies from
+# the manifest cargo is invoked on -- so building it from anywhere but its own
+# workspace needs the same patches repeated here, or it resolves crates whose
+# API it does not compile against.
+[patch.crates-io.bitcoin-send-tx-p2p]
+git = "https://github.com/Ash-L2L/bitcoin-send-tx-p2p.git"
+branch = "2026-02-28-flush-tcpstream"
+
+[patch.crates-io.temp-dir]
+git = "https://gitlab.com/A-Manning/leonhard-llc-ops.git"
+branch = "temp-dir-leak"
+
+[patch.crates-io.tracing-appender]
+git = "https://github.com/torkelrogstad/tokio-tracing.git"
+branch = "log-rotation-size"
