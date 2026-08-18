@@ -4,6 +4,7 @@
 
 #include <drivechain/messages.h>
 #include <hash.h>
+#include <primitives/transaction.h>
 #include <script/script.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
@@ -32,6 +33,17 @@ std::vector<unsigned char> SlotAndHash(SlotNum slot, const uint256& hash)
     std::vector<unsigned char> body{slot};
     body.insert(body.end(), hash.begin(), hash.end());
     return body;
+}
+
+//! Build a well-formed M8 scriptPubKey: OP_RETURN OP_PUSHBYTES_68 <tag S H P>.
+CScript M8Script(SlotNum slot, const uint256& sidechain_block_hash, const uint256& prev_main_block_hash)
+{
+    std::vector<unsigned char> bytes{OP_RETURN, M8_SCRIPT_SIZE - 2};
+    bytes.insert(bytes.end(), M8BmmRequest::TAG.begin(), M8BmmRequest::TAG.end());
+    bytes.push_back(slot);
+    bytes.insert(bytes.end(), sidechain_block_hash.begin(), sidechain_block_hash.end());
+    bytes.insert(bytes.end(), prev_main_block_hash.begin(), prev_main_block_hash.end());
+    return CScript(bytes.begin(), bytes.end());
 }
 } // namespace
 
@@ -280,6 +292,85 @@ BOOST_AUTO_TEST_CASE(coinbase_message_rejects_non_messages)
     // A tag one byte short of matching anything.
     const std::vector<unsigned char> short_tag{0xD6, 0xE1, 0xC5};
     BOOST_CHECK(!ParseCoinbaseMessage(CScript() << OP_RETURN << short_tag).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m7_bmm_accept)
+{
+    const uint256 sidechain_block_hash{Hash(std::vector<unsigned char>{'h'})};
+    const auto message{ParseCoinbaseMessage(MessageScript(M7BmmAccept::TAG, SlotAndHash(2, sidechain_block_hash)))};
+    BOOST_REQUIRE(message.has_value());
+    const auto* m7{std::get_if<M7BmmAccept>(&*message)};
+    BOOST_REQUIRE(m7 != nullptr);
+    BOOST_CHECK_EQUAL(int{m7->slot}, 2);
+    BOOST_CHECK(m7->sidechain_block_hash == sidechain_block_hash);
+
+    std::vector<unsigned char> too_long{SlotAndHash(2, sidechain_block_hash)};
+    too_long.push_back(0x00);
+    BOOST_CHECK(!ParseCoinbaseMessage(MessageScript(M7BmmAccept::TAG, too_long)).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m8_bmm_request)
+{
+    const uint256 sidechain_block_hash{Hash(std::vector<unsigned char>{'h'})};
+    const uint256 prev_main_block_hash{Hash(std::vector<unsigned char>{'p'})};
+
+    const CScript script{M8Script(5, sidechain_block_hash, prev_main_block_hash)};
+    BOOST_CHECK_EQUAL(script.size(), M8_SCRIPT_SIZE);
+
+    const auto request{ParseM8Request(script)};
+    BOOST_REQUIRE(request.has_value());
+    BOOST_CHECK_EQUAL(int{request->slot}, 5);
+    BOOST_CHECK(request->sidechain_block_hash == sidechain_block_hash);
+    BOOST_CHECK(request->prev_main_block_hash == prev_main_block_hash);
+}
+
+BOOST_AUTO_TEST_CASE(m8_is_matched_byte_exactly)
+{
+    const uint256 sidechain_block_hash{Hash(std::vector<unsigned char>{'h'})};
+    const uint256 prev_main_block_hash{Hash(std::vector<unsigned char>{'p'})};
+    const CScript valid{M8Script(5, sidechain_block_hash, prev_main_block_hash)};
+
+    // The same 68 payload bytes behind OP_PUSHDATA1. A coinbase message would
+    // accept this -- see m2_accepts_any_push_encoding -- and an M8 must not.
+    std::vector<unsigned char> pushdata1{OP_RETURN, OP_PUSHDATA1, M8_SCRIPT_SIZE - 2};
+    pushdata1.insert(pushdata1.end(), valid.begin() + 2, valid.end());
+    BOOST_CHECK(!ParseM8Request(CScript(pushdata1.begin(), pushdata1.end())).has_value());
+
+    // A trailing byte.
+    std::vector<unsigned char> trailing{valid.begin(), valid.end()};
+    trailing.push_back(0x00);
+    BOOST_CHECK(!ParseM8Request(CScript(trailing.begin(), trailing.end())).has_value());
+
+    // A truncated request.
+    std::vector<unsigned char> truncated{valid.begin(), valid.end() - 1};
+    BOOST_CHECK(!ParseM8Request(CScript(truncated.begin(), truncated.end())).has_value());
+
+    // Right length, wrong tag: the M7 tag is four bytes where M8's is three.
+    std::vector<unsigned char> wrong_tag{valid.begin(), valid.end()};
+    wrong_tag[2] = 0x01;
+    BOOST_CHECK(!ParseM8Request(CScript(wrong_tag.begin(), wrong_tag.end())).has_value());
+
+    // An M8 is not a coinbase message, and must not parse as one.
+    BOOST_CHECK(!ParseCoinbaseMessage(valid).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m8_is_read_from_output_zero_only)
+{
+    const uint256 sidechain_block_hash{Hash(std::vector<unsigned char>{'h'})};
+    const uint256 prev_main_block_hash{Hash(std::vector<unsigned char>{'p'})};
+    const CScript script{M8Script(5, sidechain_block_hash, prev_main_block_hash)};
+
+    CMutableTransaction tx;
+    BOOST_CHECK(!ParseM8Request(CTransaction{tx}).has_value());
+
+    tx.vout.emplace_back(0, script);
+    BOOST_CHECK(ParseM8Request(CTransaction{tx}).has_value());
+
+    // Moved off index 0, the same output is not a BMM request.
+    CMutableTransaction shifted;
+    shifted.vout.emplace_back(0, CScript() << OP_RETURN);
+    shifted.vout.emplace_back(0, script);
+    BOOST_CHECK(!ParseM8Request(CTransaction{shifted}).has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

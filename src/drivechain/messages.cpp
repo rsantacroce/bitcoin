@@ -6,6 +6,7 @@
 
 #include <crypto/common.h>
 #include <hash.h>
+#include <primitives/transaction.h>
 #include <script/script.h>
 #include <uint256.h>
 
@@ -161,8 +162,38 @@ std::optional<CoinbaseMessage> ParseCoinbaseMessage(const CScript& script)
         if (!parsed) return std::nullopt;
         return *parsed;
     }
+    if (const auto body{MatchTag(*payload, M7BmmAccept::TAG)}) {
+        const auto parsed{ParseSlotAndHash(*body)};
+        if (!parsed) return std::nullopt;
+        return M7BmmAccept{.slot = parsed->first, .sidechain_block_hash = parsed->second};
+    }
 
     return std::nullopt;
+}
+
+std::optional<M8BmmRequest> ParseM8Request(const CScript& script)
+{
+    // A byte-exact match, not a parse of instructions. The push opcode is
+    // pinned by the fixed message length, so OP_PUSHDATA1 does not qualify.
+    if (script.size() != M8_SCRIPT_SIZE) return std::nullopt;
+    if (script[0] != OP_RETURN) return std::nullopt;
+    if (script[1] != M8_SCRIPT_SIZE - 2) return std::nullopt;
+
+    const std::span<const unsigned char> payload{script.data() + 2, M8_SCRIPT_SIZE - 2};
+    const auto body{MatchTag(payload, M8BmmRequest::TAG)};
+    if (!body) return std::nullopt;
+
+    return M8BmmRequest{
+        .slot = (*body)[0],
+        .sidechain_block_hash = uint256{body->subspan(1, 32)},
+        .prev_main_block_hash = uint256{body->subspan(33, 32)},
+    };
+}
+
+std::optional<M8BmmRequest> ParseM8Request(const CTransaction& tx)
+{
+    if (tx.vout.empty()) return std::nullopt;
+    return ParseM8Request(tx.vout[0].scriptPubKey);
 }
 
 } // namespace drivechain

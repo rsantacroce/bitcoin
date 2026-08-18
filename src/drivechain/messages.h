@@ -23,6 +23,8 @@
 //!
 //! BIP-300: https://github.com/LayerTwo-Labs/bip300_bip301_specifications/blob/master/bip300.md
 //! BIP-301: https://github.com/LayerTwo-Labs/bip300_bip301_specifications/blob/master/bip301.md
+class CTransaction;
+
 namespace drivechain {
 
 //! A sidechain slot number. BIP-300 defines 256 slots, addressed by a single
@@ -172,8 +174,23 @@ struct M4AckBundles {
     std::vector<uint16_t> NormalizedUpvotes() const;
 };
 
+/** M7 — accept a blind merged mined sidechain block ("BMM Accept").
+ *
+ *  A miner may endorse at most one sidechain block hash per slot per block, and
+ *  her endorsement is what decides which side:block is found.
+ *
+ *  BIP-301, "M7 — BMM Accept".
+ */
+struct M7BmmAccept {
+    static constexpr std::array<unsigned char, MESSAGE_TAG_SIZE> TAG{0xD1, 0x61, 0x73, 0x68};
+
+    SlotNum slot;
+    //! The side:block hash, `h*` in the specification.
+    uint256 sidechain_block_hash;
+};
+
 //! A message carried in an output of the coinbase transaction.
-using CoinbaseMessage = std::variant<M1ProposeSidechain, M2AckSidechain, M3ProposeBundle, M4AckBundles>;
+using CoinbaseMessage = std::variant<M1ProposeSidechain, M2AckSidechain, M3ProposeBundle, M4AckBundles, M7BmmAccept>;
 
 /**
  * Parse a coinbase message from an output's scriptPubKey.
@@ -189,6 +206,62 @@ using CoinbaseMessage = std::variant<M1ProposeSidechain, M2AckSidechain, M3Propo
  * BIP-300, "Transaction validation".
  */
 std::optional<CoinbaseMessage> ParseCoinbaseMessage(const CScript& script);
+
+/** M8 — offer payment for having a sidechain block blind merge mined ("BMM
+ *  Request").
+ *
+ *  Carried by an ordinary transaction, not the coinbase. How the miner is paid
+ *  is outside consensus: enforcing nodes interpret nothing in the transaction
+ *  beyond the output at index 0.
+ *
+ *  BIP-301, "M8 — BMM Request".
+ */
+struct M8BmmRequest {
+    //! Three bytes, where every other tag in the BIP-300/301 family is four.
+    //! This is a fossil of a design in which a BMM request was a distinct
+    //! transaction type carrying a critical-data field rather than an ordinary
+    //! transaction with an OP_RETURN output, and not a constraint on any
+    //! replacement encoding.
+    static constexpr std::array<unsigned char, 3> TAG{0x00, 0xBF, 0x00};
+
+    SlotNum slot;
+    //! The side:block hash, `h*`, which must match an M7 in the same block.
+    uint256 sidechain_block_hash;
+    //! The hash of this block's parent, `P`, in internal byte order — directly
+    //! comparable to CBlockHeader::hashPrevBlock. It confines a request to the
+    //! single block it was written for, so a miner cannot hoard old requests
+    //! and mine them later for side:blocks that can no longer connect.
+    uint256 prev_main_block_hash;
+};
+
+//! Length of an M8 scriptPubKey, in bytes: OP_RETURN, OP_PUSHBYTES_68, and 68
+//! bytes of payload.
+static constexpr size_t M8_SCRIPT_SIZE{70};
+
+/**
+ * If `script` is an M8 request, parse it.
+ *
+ * Unlike every other message here, this is a fixed byte-prefix match rather
+ * than a parse of script instructions: the script MUST begin literally
+ * `6A 44` and end after `P`. An OP_PUSHDATA1 encoding of the same 68 payload
+ * bytes is not an M8 at all. The asymmetry is inherited from the deployed
+ * format rather than required by BIP-301, but it is consensus-visible, so it
+ * is reproduced exactly.
+ *
+ * BIP-301, "M8 — BMM Request", and Appendix A item 5.
+ */
+std::optional<M8BmmRequest> ParseM8Request(const CScript& script);
+
+/**
+ * If `tx` carries an M8 request, parse it.
+ *
+ * Only the output at index 0 is examined; an M8-shaped output anywhere else in
+ * the transaction is not a BMM request. Enforcing nodes MUST NOT interpret any
+ * other part of the transaction.
+ *
+ * BIP-301, "M8 — BMM Request".
+ */
+std::optional<M8BmmRequest> ParseM8Request(const CTransaction& tx);
 
 } // namespace drivechain
 
