@@ -6,9 +6,12 @@
 #define BITCOIN_DRIVECHAIN_MESSAGES_H
 
 #include <script/script.h>
+#include <uint256.h>
 
+#include <array>
 #include <cstdint>
 #include <optional>
+#include <variant>
 #include <vector>
 
 //! Wire formats for the BIP-300/301 messages.
@@ -82,6 +85,110 @@ std::optional<SlotNum> ParseTreasuryScript(const CScript& script);
  * *not* parsed this way; see ParseM8Request.
  */
 std::optional<std::vector<unsigned char>> ParseOpReturnPayload(const CScript& script);
+
+//! Length of a message tag, in bytes. M8 is the exception; see ParseM8Request.
+static constexpr size_t MESSAGE_TAG_SIZE{4};
+
+/** M1 — propose that the sidechain described by `description` take a slot.
+ *
+ *  BIP-300, "M1 — Propose Sidechain".
+ */
+struct M1ProposeSidechain {
+    static constexpr std::array<unsigned char, MESSAGE_TAG_SIZE> TAG{0xD5, 0xE0, 0xC4, 0xAF};
+
+    SlotNum slot;
+    //! The sidechain description `D`, an opaque byte array. BIP-300 assigns it
+    //! no structure: whatever a sidechain's authors agree it means is between
+    //! them and their users, and consensus code parses none of it. Its length
+    //! is bounded only by Bitcoin's own rules.
+    std::vector<unsigned char> description;
+
+    //! sha256d(D), the identifier an M2 votes for.
+    uint256 ProposalId() const;
+};
+
+/** M2 — acknowledge a sidechain proposal.
+ *
+ *  BIP-300, "M2 — ACK Sidechain Proposal".
+ */
+struct M2AckSidechain {
+    //! Spec divergence: both specifications give this tag as D6 E1 C5 BF; the
+    //! reference implementation uses D6 E1 C5 DF (lib/messages.rs). One of the
+    //! three sources has a wire-format bug and the question is open with the
+    //! specification authors. Following the implementation, since that is what
+    //! interoperating software has to match today.
+    static constexpr std::array<unsigned char, MESSAGE_TAG_SIZE> TAG{0xD6, 0xE1, 0xC5, 0xDF};
+
+    SlotNum slot;
+    uint256 proposal_id;
+};
+
+/** M3 — propose a withdrawal bundle.
+ *
+ *  BIP-300, "M3 — Propose Bundle".
+ */
+struct M3ProposeBundle {
+    static constexpr std::array<unsigned char, MESSAGE_TAG_SIZE> TAG{0xD4, 0x5A, 0xA9, 0x43};
+
+    SlotNum slot;
+    uint256 m6id;
+};
+
+/** M4 — acknowledge withdrawal bundles, one vote per active sidechain slot.
+ *
+ *  BIP-300, "M4 — ACK Bundle(s)".
+ */
+struct M4AckBundles {
+    static constexpr std::array<unsigned char, MESSAGE_TAG_SIZE> TAG{0xD7, 0x7D, 0x17, 0x76};
+
+    enum class Version : uint8_t {
+        //! Cast the votes the previous block's M4 resolved to. Carries no
+        //! vote array.
+        REPEAT_PREVIOUS = 0x00,
+        VOTES_ONE_BYTE = 0x01,
+        VOTES_TWO_BYTE = 0x02,
+        //! Per slot, upvote a bundle leading every other by at least 50.
+        //! Carries no vote array.
+        UPVOTE_LEADING_BY_50 = 0x03,
+    };
+
+    static constexpr uint8_t ALARM_ONE_BYTE{0xFE};
+    static constexpr uint8_t ABSTAIN_ONE_BYTE{0xFF};
+    static constexpr uint16_t ALARM_TWO_BYTES{0xFFFE};
+    static constexpr uint16_t ABSTAIN_TWO_BYTES{0xFFFF};
+
+    Version version;
+    //! Votes exactly as encoded, widened to 16 bits without translation. A
+    //! one-byte 0xFF is stored as 0x00FF, *not* as ABSTAIN_TWO_BYTES, because
+    //! the encoding has to survive parsing intact: BIP-300 rejects a block
+    //! whose M4 uses VOTES_TWO_BYTE where one byte would have sufficed, which
+    //! is only decidable from the raw values. Use NormalizedUpvotes() to read
+    //! the votes; do not compare these against the two-byte sentinels.
+    std::vector<uint16_t> upvotes;
+
+    //! The votes with the sentinels translated into their two-byte form, so a
+    //! caller can interpret both encodings the same way. Empty for the two
+    //! versions that carry no vote array.
+    std::vector<uint16_t> NormalizedUpvotes() const;
+};
+
+//! A message carried in an output of the coinbase transaction.
+using CoinbaseMessage = std::variant<M1ProposeSidechain, M2AckSidechain, M3ProposeBundle, M4AckBundles>;
+
+/**
+ * Parse a coinbase message from an output's scriptPubKey.
+ *
+ * A script that is not a well-formed message returns nullopt, which is not an
+ * error: BIP-300 says such an output MUST be treated as an ordinary script and
+ * the block stays valid. Malformed and absent are the same thing here.
+ *
+ * The caller must only apply this to outputs of the coinbase transaction. An
+ * M1/M2/M3/M4-shaped output anywhere else MUST be ignored, and this function
+ * has no way to tell the difference.
+ *
+ * BIP-300, "Transaction validation".
+ */
+std::optional<CoinbaseMessage> ParseCoinbaseMessage(const CScript& script);
 
 } // namespace drivechain
 

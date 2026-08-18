@@ -3,15 +3,37 @@
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
 #include <drivechain/messages.h>
+#include <hash.h>
 #include <script/script.h>
 #include <test/util/setup_common.h>
+#include <uint256.h>
 
 #include <boost/test/unit_test.hpp>
 
+#include <cstdint>
 #include <optional>
+#include <span>
+#include <variant>
 #include <vector>
 
 using namespace drivechain;
+
+namespace {
+//! Build `OP_RETURN <tag || body>`, the shape every coinbase message takes.
+CScript MessageScript(std::span<const unsigned char> tag, std::span<const unsigned char> body)
+{
+    std::vector<unsigned char> payload{tag.begin(), tag.end()};
+    payload.insert(payload.end(), body.begin(), body.end());
+    return CScript() << OP_RETURN << payload;
+}
+
+std::vector<unsigned char> SlotAndHash(SlotNum slot, const uint256& hash)
+{
+    std::vector<unsigned char> body{slot};
+    body.insert(body.end(), hash.begin(), hash.end());
+    return body;
+}
+} // namespace
 
 BOOST_FIXTURE_TEST_SUITE(drivechain_messages_tests, BasicTestingSetup)
 
@@ -86,6 +108,178 @@ BOOST_AUTO_TEST_CASE(op_return_payload_rejects_other_shapes)
     // A truncated push: claims 4 bytes, carries 2.
     const std::vector<unsigned char> truncated{OP_RETURN, 0x04, 0x01, 0x02};
     BOOST_CHECK(!ParseOpReturnPayload(CScript(truncated.begin(), truncated.end())).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m1_propose_sidechain)
+{
+    const std::vector<unsigned char> description{'s', 'i', 'd', 'e', 'c', 'h', 'a', 'i', 'n'};
+    std::vector<unsigned char> body{7};
+    body.insert(body.end(), description.begin(), description.end());
+
+    const auto message{ParseCoinbaseMessage(MessageScript(M1ProposeSidechain::TAG, body))};
+    BOOST_REQUIRE(message.has_value());
+    const auto* m1{std::get_if<M1ProposeSidechain>(&*message)};
+    BOOST_REQUIRE(m1 != nullptr);
+    BOOST_CHECK_EQUAL(int{m1->slot}, 7);
+    BOOST_CHECK_EQUAL_COLLECTIONS(m1->description.begin(), m1->description.end(),
+                                  description.begin(), description.end());
+    BOOST_CHECK(m1->ProposalId() == Hash(description));
+
+    // The description is opaque and unbounded, so an empty one is well formed.
+    const std::vector<unsigned char> slot_only{7};
+    const auto empty{ParseCoinbaseMessage(MessageScript(M1ProposeSidechain::TAG, slot_only))};
+    BOOST_REQUIRE(empty.has_value());
+    BOOST_CHECK(std::get<M1ProposeSidechain>(*empty).description.empty());
+
+    // ... but the slot byte is not optional.
+    BOOST_CHECK(!ParseCoinbaseMessage(MessageScript(M1ProposeSidechain::TAG, {})).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m2_ack_sidechain)
+{
+    // Pinned deliberately: both specifications say BF where the reference
+    // implementation says DF, and this patchset follows the implementation. If
+    // that resolves the other way, this test is the first thing that fails.
+    const std::array<unsigned char, 4> expected_tag{0xD6, 0xE1, 0xC5, 0xDF};
+    BOOST_CHECK_EQUAL_COLLECTIONS(M2AckSidechain::TAG.begin(), M2AckSidechain::TAG.end(),
+                                  expected_tag.begin(), expected_tag.end());
+
+    const uint256 proposal_id{Hash(std::vector<unsigned char>{'d'})};
+    const auto message{ParseCoinbaseMessage(MessageScript(M2AckSidechain::TAG, SlotAndHash(3, proposal_id)))};
+    BOOST_REQUIRE(message.has_value());
+    const auto* m2{std::get_if<M2AckSidechain>(&*message)};
+    BOOST_REQUIRE(m2 != nullptr);
+    BOOST_CHECK_EQUAL(int{m2->slot}, 3);
+    BOOST_CHECK(m2->proposal_id == proposal_id);
+}
+
+BOOST_AUTO_TEST_CASE(m2_length_is_exact)
+{
+    const uint256 proposal_id{Hash(std::vector<unsigned char>{'d'})};
+
+    std::vector<unsigned char> too_long{SlotAndHash(3, proposal_id)};
+    too_long.push_back(0x00);
+    BOOST_CHECK(!ParseCoinbaseMessage(MessageScript(M2AckSidechain::TAG, too_long)).has_value());
+
+    std::vector<unsigned char> too_short{SlotAndHash(3, proposal_id)};
+    too_short.pop_back();
+    BOOST_CHECK(!ParseCoinbaseMessage(MessageScript(M2AckSidechain::TAG, too_short)).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m2_accepts_any_push_encoding)
+{
+    // Coinbase messages are parsed as script instructions, so the push opcode
+    // is not part of the match. M8 is the exception, and the asymmetry is easy
+    // to lose in a shared parser.
+    const uint256 proposal_id{Hash(std::vector<unsigned char>{'d'})};
+    const std::vector<unsigned char> body{SlotAndHash(3, proposal_id)};
+
+    std::vector<unsigned char> payload{M2AckSidechain::TAG.begin(), M2AckSidechain::TAG.end()};
+    payload.insert(payload.end(), body.begin(), body.end());
+
+    // Same 37 payload bytes, pushed with OP_PUSHDATA1 instead of the minimal
+    // OP_PUSHBYTES_37 that CScript would choose.
+    std::vector<unsigned char> bytes{OP_RETURN, OP_PUSHDATA1, static_cast<unsigned char>(payload.size())};
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+
+    const auto message{ParseCoinbaseMessage(CScript(bytes.begin(), bytes.end()))};
+    BOOST_REQUIRE(message.has_value());
+    BOOST_CHECK(std::holds_alternative<M2AckSidechain>(*message));
+}
+
+BOOST_AUTO_TEST_CASE(m3_propose_bundle)
+{
+    const uint256 m6id{Hash(std::vector<unsigned char>{'b'})};
+    const auto message{ParseCoinbaseMessage(MessageScript(M3ProposeBundle::TAG, SlotAndHash(1, m6id)))};
+    BOOST_REQUIRE(message.has_value());
+    const auto* m3{std::get_if<M3ProposeBundle>(&*message)};
+    BOOST_REQUIRE(m3 != nullptr);
+    BOOST_CHECK_EQUAL(int{m3->slot}, 1);
+    BOOST_CHECK(m3->m6id == m6id);
+}
+
+BOOST_AUTO_TEST_CASE(m4_versions_without_votes)
+{
+    for (const unsigned char version : {0x00, 0x03}) {
+        const std::vector<unsigned char> body{version};
+        const auto message{ParseCoinbaseMessage(MessageScript(M4AckBundles::TAG, body))};
+        BOOST_REQUIRE(message.has_value());
+        const auto* m4{std::get_if<M4AckBundles>(&*message)};
+        BOOST_REQUIRE(m4 != nullptr);
+        BOOST_CHECK(m4->version == static_cast<M4AckBundles::Version>(version));
+        BOOST_CHECK(m4->upvotes.empty());
+
+        // Neither version carries a vote array, so a byte after the version
+        // makes the message malformed rather than a vote.
+        const std::vector<unsigned char> with_votes{version, 0x00};
+        BOOST_CHECK(!ParseCoinbaseMessage(MessageScript(M4AckBundles::TAG, with_votes)).has_value());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(m4_one_byte_votes)
+{
+    const std::vector<unsigned char> body{0x01, 0x00, 0x07, M4AckBundles::ALARM_ONE_BYTE, M4AckBundles::ABSTAIN_ONE_BYTE};
+    const auto message{ParseCoinbaseMessage(MessageScript(M4AckBundles::TAG, body))};
+    BOOST_REQUIRE(message.has_value());
+    const auto* m4{std::get_if<M4AckBundles>(&*message)};
+    BOOST_REQUIRE(m4 != nullptr);
+    BOOST_CHECK(m4->version == M4AckBundles::Version::VOTES_ONE_BYTE);
+
+    // Stored exactly as encoded: the sentinels are still one-byte values.
+    const std::vector<uint16_t> raw{0x0000, 0x0007, 0x00FE, 0x00FF};
+    BOOST_CHECK_EQUAL_COLLECTIONS(m4->upvotes.begin(), m4->upvotes.end(), raw.begin(), raw.end());
+
+    const std::vector<uint16_t> normalized{0x0000, 0x0007, M4AckBundles::ALARM_TWO_BYTES, M4AckBundles::ABSTAIN_TWO_BYTES};
+    const std::vector<uint16_t> got{m4->NormalizedUpvotes()};
+    BOOST_CHECK_EQUAL_COLLECTIONS(got.begin(), got.end(), normalized.begin(), normalized.end());
+
+    // An empty vote array is well formed; whether it is *valid* depends on how
+    // many sidechains are active, which is a connect-time question.
+    const std::vector<unsigned char> no_votes{0x01};
+    BOOST_REQUIRE(ParseCoinbaseMessage(MessageScript(M4AckBundles::TAG, no_votes)).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m4_two_byte_votes)
+{
+    // Little-endian, per BIP-300.
+    const std::vector<unsigned char> body{0x02, 0x01, 0x01, 0xFE, 0xFF};
+    const auto message{ParseCoinbaseMessage(MessageScript(M4AckBundles::TAG, body))};
+    BOOST_REQUIRE(message.has_value());
+    const auto* m4{std::get_if<M4AckBundles>(&*message)};
+    BOOST_REQUIRE(m4 != nullptr);
+    BOOST_CHECK(m4->version == M4AckBundles::Version::VOTES_TWO_BYTE);
+
+    const std::vector<uint16_t> expected{0x0101, M4AckBundles::ALARM_TWO_BYTES};
+    BOOST_CHECK_EQUAL_COLLECTIONS(m4->upvotes.begin(), m4->upvotes.end(), expected.begin(), expected.end());
+    // Already two-byte values, so normalization is the identity.
+    const std::vector<uint16_t> got{m4->NormalizedUpvotes()};
+    BOOST_CHECK_EQUAL_COLLECTIONS(got.begin(), got.end(), expected.begin(), expected.end());
+
+    // An odd trailing byte is not half a vote.
+    const std::vector<unsigned char> odd{0x02, 0x01, 0x01, 0xFE};
+    BOOST_CHECK(!ParseCoinbaseMessage(MessageScript(M4AckBundles::TAG, odd)).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m4_rejects_unknown_version)
+{
+    for (const unsigned char version : {0x04, 0x7F, 0xFF}) {
+        const std::vector<unsigned char> body{version};
+        BOOST_CHECK(!ParseCoinbaseMessage(MessageScript(M4AckBundles::TAG, body)).has_value());
+    }
+    // No version byte at all.
+    BOOST_CHECK(!ParseCoinbaseMessage(MessageScript(M4AckBundles::TAG, {})).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(coinbase_message_rejects_non_messages)
+{
+    // Not an OP_RETURN at all.
+    BOOST_CHECK(!ParseCoinbaseMessage(TreasuryScript(0)).has_value());
+    // An OP_RETURN carrying something that is not a message.
+    const std::vector<unsigned char> junk{0xFF, 0xFF, 0xFF, 0xFF, 0x00};
+    BOOST_CHECK(!ParseCoinbaseMessage(CScript() << OP_RETURN << junk).has_value());
+    // A tag one byte short of matching anything.
+    const std::vector<unsigned char> short_tag{0xD6, 0xE1, 0xC5};
+    BOOST_CHECK(!ParseCoinbaseMessage(CScript() << OP_RETURN << short_tag).has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
