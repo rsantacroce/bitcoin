@@ -191,6 +191,21 @@ A chainstate loaded from a UTXO snapshot describes no block, so these rules are
 not enforced on it: it has no history to derive the state from and the snapshot
 carries none. Its blocks are validated by the background chainstate, which does.
 
+**Phase 7** is proving it, from two directions at once.
+
+29. differential vectors generated from the reference implementation
+30. a functional test that deposits into a treasury and withdraws from it
+
+The vectors say what the deployed enforcer decides; the functional test says
+that coins actually move. Between them they cover the two ways this could be
+wrong: disagreeing with the implementation it has to match, and agreeing with it
+while not working.
+
+The functional test computes the `M6ID` independently, from the specification
+rather than from the C++, and asserts the node arrives at the same identifier
+from the same transaction. That is a third implementation of the rule agreeing
+with the other two.
+
 **Phase 6** is mempool policy and the RPC surface.
 
 27. keeping transactions that cannot be mined out of the mempool
