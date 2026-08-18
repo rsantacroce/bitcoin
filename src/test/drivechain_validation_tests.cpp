@@ -2,7 +2,10 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
+#include <drivechain/diff.h>
 #include <drivechain/messages.h>
+#include <drivechain/params.h>
+#include <drivechain/state.h>
 #include <drivechain/validation.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
@@ -61,6 +64,28 @@ CMutableTransaction Coinbase(const std::vector<CScript>& outputs)
         tx.vout.emplace_back(0, script);
     }
     return tx;
+}
+
+Sidechain MakeProposal(SlotNum slot, const char* description, int32_t height)
+{
+    Sidechain sidechain;
+    sidechain.slot = slot;
+    sidechain.description = std::vector<unsigned char>{description, description + strlen(description)};
+    sidechain.proposal_height = height;
+    return sidechain;
+}
+
+M1ProposeSidechain M1(SlotNum slot, const char* description)
+{
+    return M1ProposeSidechain{
+        .slot = slot,
+        .description = std::vector<unsigned char>{description, description + strlen(description)},
+    };
+}
+
+M2AckSidechain M2(const Sidechain& proposal)
+{
+    return M2AckSidechain{.slot = proposal.slot, .proposal_id = proposal.Id().description_hash};
 }
 
 BlockError CollectError(const std::vector<CScript>& outputs)
@@ -188,6 +213,134 @@ BOOST_AUTO_TEST_CASE(error_strings_are_distinct)
         BOOST_CHECK(reason != "bad-drivechain-unknown");
         BOOST_CHECK(seen.insert(reason).second);
     }
+}
+
+BOOST_AUTO_TEST_CASE(m1_creates_a_proposal_with_no_votes)
+{
+    DrivechainState state;
+    const auto diff{HandleM1(M1(1, "alpha"), state, 500)};
+    BOOST_REQUIRE(diff.has_value());
+    BOOST_CHECK_EQUAL(int{diff->sidechain.slot}, 1);
+    BOOST_CHECK_EQUAL(diff->sidechain.vote_count, 0);
+    BOOST_CHECK_EQUAL(diff->sidechain.proposal_height, 500);
+    BOOST_CHECK_EQUAL(diff->sidechain.activation_height, NO_HEIGHT);
+}
+
+BOOST_AUTO_TEST_CASE(m1_repeating_an_existing_proposal_is_ignored)
+{
+    // Without this an M1 would reset the proposal's accumulated votes, and any
+    // miner could wipe any proposal's progress at will.
+    DrivechainState state;
+    Sidechain existing{MakeProposal(1, "alpha", 100)};
+    existing.vote_count = 900;
+    state.PutProposal(existing);
+
+    BOOST_CHECK(!HandleM1(M1(1, "alpha"), state, 500).has_value());
+
+    // A different description for the same slot is a different proposal.
+    BOOST_CHECK(HandleM1(M1(1, "beta"), state, 500).has_value());
+    // As is the same description in a different slot.
+    BOOST_CHECK(HandleM1(M1(2, "alpha"), state, 500).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m2_for_an_unknown_proposal_is_ignored)
+{
+    DrivechainState state;
+    const Sidechain proposal{MakeProposal(1, "alpha", 100)};
+    BOOST_CHECK(!HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 500).has_value());
+
+    // The slot is part of the identity, so an ack naming the right hash under
+    // the wrong slot finds nothing.
+    state.PutProposal(proposal);
+    M2AckSidechain wrong_slot{M2(proposal)};
+    wrong_slot.slot = 2;
+    BOOST_CHECK(!HandleM2(wrong_slot, state, MAINNET_THRESHOLDS, 500).has_value());
+    BOOST_CHECK(HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 500).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m2_cannot_ack_a_proposal_made_in_the_same_block)
+{
+    // BIP-300 counts an ack only once the proposal sits in an ancestor block.
+    // Otherwise a miner could seed a fresh proposal with a vote in the very
+    // block that proposed it.
+    DrivechainState state;
+    const Sidechain proposal{MakeProposal(1, "alpha", 500)};
+    state.PutProposal(proposal);
+
+    BOOST_CHECK(!HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 500).has_value());
+    BOOST_CHECK(HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 501).has_value());
+}
+
+BOOST_AUTO_TEST_CASE(m2_activates_an_empty_slot_at_the_bar)
+{
+    DrivechainState state;
+    Sidechain proposal{MakeProposal(1, "alpha", 0)};
+    // One ack short of the 90% bar for claiming an empty slot.
+    proposal.vote_count = 1814;
+    state.PutProposal(proposal);
+
+    // This ack makes 1815, which is not more than 1815.
+    const auto no_activation{HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 2016)};
+    BOOST_REQUIRE(no_activation.has_value());
+    BOOST_CHECK(no_activation->effect == AckSidechainProposal::Effect::NO_ACTIVATION);
+
+    proposal.vote_count = 1815;
+    state.PutProposal(proposal);
+    const auto activation{HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 2016)};
+    BOOST_REQUIRE(activation.has_value());
+    BOOST_CHECK(activation->effect == AckSidechainProposal::Effect::SLOT_ACTIVATION);
+
+    // One block past the window and the same ack no longer activates.
+    BOOST_CHECK(HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 2017)->effect ==
+                AckSidechainProposal::Effect::NO_ACTIVATION);
+}
+
+BOOST_AUTO_TEST_CASE(m2_overwriting_a_slot_carries_the_incumbent)
+{
+    // Overwriting an occupied slot needs only the used-slot bar, which is a
+    // bare majority sustained over 26300 blocks rather than the 90% required
+    // to claim an empty one.
+    DrivechainState state;
+    Sidechain incumbent{MakeProposal(1, "alpha", 0)};
+    incumbent.activation_height = 10;
+    state.ActivateSidechain(incumbent);
+
+    Sidechain challenger{MakeProposal(1, "beta", 0)};
+    challenger.vote_count = 13150;
+    state.PutProposal(challenger);
+
+    const auto ack{HandleM2(M2(challenger), state, MAINNET_THRESHOLDS, 26300)};
+    BOOST_REQUIRE(ack.has_value());
+    BOOST_CHECK(ack->effect == AckSidechainProposal::Effect::REPLACE_ACTIVE);
+    // Undo has no other way to put the displaced sidechain back.
+    BOOST_CHECK(ack->replaced == incumbent);
+}
+
+BOOST_AUTO_TEST_CASE(m2_ack_applied_to_state_matches_what_it_says)
+{
+    // The diff is what actually moves the state, so check the two agree rather
+    // than only checking the diff.
+    DrivechainState state;
+    Sidechain proposal{MakeProposal(1, "alpha", 0)};
+    proposal.vote_count = 1815;
+    state.PutProposal(proposal);
+
+    const auto ack{HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 2016)};
+    BOOST_REQUIRE(ack.has_value());
+
+    BlockDiff block;
+    block.coinbase.msgs.push_back(*ack);
+    const DrivechainState before{state};
+    BOOST_REQUIRE(block.Apply(state, 2016));
+
+    BOOST_REQUIRE(state.FindActiveSidechain(1) != nullptr);
+    BOOST_CHECK_EQUAL(state.FindActiveSidechain(1)->vote_count, 1816);
+    BOOST_CHECK_EQUAL(state.FindActiveSidechain(1)->activation_height, 2016);
+    BOOST_CHECK(state.FindProposal(proposal.Id()) == nullptr);
+
+    UndoError undo_error{};
+    BOOST_REQUIRE(block.Undo(state, undo_error));
+    BOOST_CHECK(state == before);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -5,9 +5,12 @@
 #include <drivechain/validation.h>
 
 #include <drivechain/messages.h>
+#include <drivechain/params.h>
+#include <drivechain/state.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <optional>
@@ -80,6 +83,63 @@ bool CollectCoinbaseMessages(const CTransaction& coinbase, CoinbaseMessages& out
     }
 
     return true;
+}
+
+std::optional<NewSidechainProposal> HandleM1(const M1ProposeSidechain& m1, const DrivechainState& state, int32_t height)
+{
+    Sidechain sidechain;
+    sidechain.slot = m1.slot;
+    sidechain.description = m1.description;
+    sidechain.vote_count = 0;
+    sidechain.proposal_height = height;
+    sidechain.activation_height = NO_HEIGHT;
+
+    // Already proposed: ignore rather than overwrite. The description hash is
+    // part of the identity, so an entry with this id has the same description,
+    // and the only thing overwriting could change is the vote count -- which is
+    // exactly what must not be resettable.
+    if (state.FindProposal(sidechain.Id()) != nullptr) return std::nullopt;
+
+    return NewSidechainProposal{.sidechain = sidechain};
+}
+
+std::optional<AckSidechainProposal> HandleM2(const M2AckSidechain& m2,
+                                             const DrivechainState& state,
+                                             const Thresholds& thresholds,
+                                             int32_t height)
+{
+    const SidechainProposalId id{.slot = m2.slot, .description_hash = m2.proposal_id};
+    const Sidechain* proposal{state.FindProposal(id)};
+    // No matching proposal, or one whose slot does not match: ignored. Note
+    // that the slot is part of the id, so a mismatch simply fails to find it.
+    if (proposal == nullptr) return std::nullopt;
+
+    // BIP-300 counts an ack only once the proposal exists in an ancestor
+    // block. Within one coinbase the M1 is applied before any later M2, so a
+    // proposal acked in the block that proposed it still has this height.
+    if (proposal->proposal_height == height) return std::nullopt;
+
+    const uint16_t vote_count{static_cast<uint16_t>(proposal->vote_count + 1)};
+    // Saturating: a proposal held over from a previous sync may sit above the
+    // current height, and an age that wrapped would silently never activate.
+    const int32_t age{std::max(0, height - proposal->proposal_height)};
+
+    const Sidechain* incumbent{state.FindActiveSidechain(m2.slot)};
+    const bool slot_is_used{incumbent != nullptr};
+
+    AckSidechainProposal ack;
+    ack.id = id;
+    if (!thresholds.ProposalActivates(vote_count, age, slot_is_used)) {
+        ack.effect = AckSidechainProposal::Effect::NO_ACTIVATION;
+    } else if (slot_is_used) {
+        // The displaced sidechain has to travel with the diff: undo has no
+        // other way to put it back.
+        ack.effect = AckSidechainProposal::Effect::REPLACE_ACTIVE;
+        ack.replaced = *incumbent;
+    } else {
+        ack.effect = AckSidechainProposal::Effect::SLOT_ACTIVATION;
+    }
+    return ack;
 }
 
 } // namespace drivechain

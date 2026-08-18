@@ -7,10 +7,12 @@
 
 #include <drivechain/diff.h>
 #include <drivechain/messages.h>
+#include <drivechain/params.h>
 #include <drivechain/state.h>
 #include <primitives/transaction.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,6 +76,41 @@ struct CoinbaseMessages {
  * rules.
  */
 [[nodiscard]] bool CollectCoinbaseMessages(const CTransaction& coinbase, CoinbaseMessages& out, BlockError& error);
+
+/**
+ * Handle an M1: propose that a sidechain occupy a slot.
+ *
+ * Returns nothing when the proposal is ignored, which happens when the same
+ * (slot, description) already has an entry. That rule is what stops a miner
+ * resetting an accumulated vote count by re-proposing: without it, any
+ * proposal's progress could be wiped at will.
+ *
+ * An M1 cannot make a block invalid.
+ *
+ * BIP-300, "M1 — Propose Sidechain".
+ */
+std::optional<NewSidechainProposal> HandleM1(const M1ProposeSidechain& m1, const DrivechainState& state, int32_t height);
+
+/**
+ * Handle an M2: acknowledge a sidechain proposal, possibly activating it.
+ *
+ * Returns nothing when the M2 is ignored, which happens when no proposal
+ * matches the (slot, description hash) it names, or when the proposal it names
+ * was made in this very block. The second case matters: without it a miner
+ * could seed a fresh proposal with a vote in the block that proposes it, and
+ * BIP-300 requires the proposal to sit in an ancestor block.
+ *
+ * `state` must already carry the effect of the earlier messages in this
+ * coinbase, which is how the same-block case is detected at all.
+ *
+ * An M2 cannot make a block invalid.
+ *
+ * BIP-300, "M2 — ACK Sidechain Proposal".
+ */
+std::optional<AckSidechainProposal> HandleM2(const M2AckSidechain& m2,
+                                             const DrivechainState& state,
+                                             const Thresholds& thresholds,
+                                             int32_t height);
 
 } // namespace drivechain
 
