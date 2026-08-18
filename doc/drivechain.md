@@ -62,9 +62,10 @@ follows that split:
 | `src/drivechain/state.{h,cpp}` | D1 and D2, the two lists an enforcing node maintains |
 | `src/drivechain/diff.{h,cpp}` | what one block does to that state, and how to undo it |
 | `src/drivechain/db.{h,cpp}` | persistence for both |
+| `src/drivechain/params.{h,cpp}` | thresholds and activation, per network |
 
-Later phases add the script flag, connect-time validation, mempool policy and
-RPCs. This document grows with them.
+Later phases add connect-time validation, the rest of mempool policy, and RPCs.
+This document grows with them.
 
 Everything under `src/drivechain/` is new code; the diff against upstream files
 is deliberately kept to a handful of call sites so that the patchset stays
@@ -100,6 +101,17 @@ state exactly. Everything in Phase 4 depends on it, and a reorg that leaves the
 state subtly wrong would not be visible until a block is rejected hundreds of
 blocks later. That is why the fuzz target lands here rather than at the end.
 
+**Phase 3** is the parameters and the relay policy:
+
+10. the network thresholds, and the comparisons made against them
+11. activation and thresholds per network in chainparams
+12. relaying spends of treasury outputs
+13. relaying creation of treasury outputs
+
+Only regtest activates. Choosing a mainnet activation is a deployment decision
+nobody has made, and inventing a height here would be answering a question that
+has not been asked.
+
 ## Notes for implementers
 
 **M7 and M8 are not parsed the same way, and the asymmetry is load-bearing.**
@@ -116,9 +128,21 @@ the state it is handed — it has to be told which bundles actually lost a vote 
 where in the list each one sat. Anything that looks like redundancy in
 `diff.h` is almost certainly this.
 
-**`OP_DRIVECHAIN` is `OP_NOP5`, and the treasury is anyone-can-spend to a node
-that does not enforce these rules.** The treasury script
-`OP_NOP5 OP_PUSHBYTES_1 <slot> OP_TRUE` evaluates true with an empty scriptSig
-under current consensus. That is what makes BIP-300 a soft fork, and it is also
-why the rules that reject treasury spends are the peg itself rather than a
-convenience.
+**`OP_DRIVECHAIN` is `OP_NOP5`, and the treasury is anyone-can-spend — to
+enforcing and non-enforcing nodes alike.** The treasury script
+`OP_NOP5 OP_PUSHBYTES_1 <slot> OP_TRUE` evaluates true with an empty scriptSig,
+and BIP-300 does not change that. It cannot: if the interpreter rejected a
+treasury spend, it would reject the legitimate deposits and withdrawals too,
+since `ConnectBlock` verifies input scripts before it has any chance to
+authorise anything.
+
+So there is **no consensus change to the script interpreter in this patchset**,
+and there will not be one. Every rule that protects the treasury is a
+block-level rule in `ConnectBlock`, which is why those rejections are the peg
+itself rather than a convenience — and why relaxing any of them is a different
+proposition from relaxing the rest.
+
+The only script-layer change here is relay policy: a treasury output and its
+spend are made standard, so deposits and withdrawals reach a miner. The
+reference implementation cannot do that from outside the node, and tells its
+users to run with `acceptnonstdtxn=1` instead.
