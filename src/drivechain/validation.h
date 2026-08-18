@@ -9,6 +9,7 @@
 #include <drivechain/messages.h>
 #include <drivechain/params.h>
 #include <drivechain/state.h>
+#include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
 
@@ -80,6 +81,9 @@ enum class BlockError {
     BMM_REQUEST_EXPIRED,
     //! More than one valid M8 for the same slot in one block.
     MULTIPLE_BMM_REQUESTS,
+    //! A block with no transactions at all. Core's CheckBlock rejects this
+    //! first; the check is here so the rule set does not depend on that.
+    NO_COINBASE,
     //! The state does not contain what a diff built against it expects. A bug
     //! or corruption, not a bad block.
     STATE_MISMATCH,
@@ -266,6 +270,44 @@ static constexpr uint16_t LEADING_BY_50_MARGIN{50};
                             const uint256& parent_hash,
                             std::optional<SlotNum>& slot,
                             BlockError& error);
+
+//! What a block needs to know about the one before it.
+struct BlockContext {
+    //! Height of the block being connected.
+    int32_t height{0};
+    //! Hash of its parent, which an M8 must name.
+    uint256 parent_hash;
+    //! The votes the previous block's M4 resolved to, which this block's
+    //! REPEAT_PREVIOUS replays. Empty when the previous block had no M4, or
+    //! none that resolved to anything.
+    AckBundles previous_votes;
+};
+
+//! The votes a block's diff resolved to, for the next block's REPEAT_PREVIOUS.
+AckBundles ResolvedVotes(const BlockDiff& diff);
+
+/**
+ * Check a block against every BIP-300/301 rule and produce the diff it makes.
+ *
+ * Blocks below `activation_height` are plain Bitcoin history: recorded, but
+ * never scanned for messages or deposits, so they produce an empty diff.
+ *
+ * The order of the steps is the order the reference implementation uses, and it
+ * is load-bearing rather than incidental. Coinbase messages are applied in
+ * output order to a running state, so an M2 can see an M1 from the same
+ * coinbase and an M4 can see a bundle an M3 has just proposed. Ageing follows
+ * the messages, so a bundle proposed in this block does not immediately expire.
+ * Transactions follow both.
+ *
+ * Returns false, setting `error`, if the block is invalid.
+ */
+[[nodiscard]] bool ConnectBlock(const CBlock& block,
+                                const BlockContext& context,
+                                const DrivechainState& state,
+                                const Thresholds& thresholds,
+                                int32_t activation_height,
+                                BlockDiff& diff,
+                                BlockError& error);
 
 } // namespace drivechain
 

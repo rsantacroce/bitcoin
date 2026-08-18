@@ -9,6 +9,7 @@
 #include <drivechain/params.h>
 #include <drivechain/state.h>
 #include <drivechain/validation.h>
+#include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <test/util/setup_common.h>
@@ -184,6 +185,32 @@ CMutableTransaction M8Tx(SlotNum slot, const uint256& sidechain_block_hash, cons
     return tx;
 }
 
+CBlock MakeBlock(const std::vector<CScript>& coinbase_outputs, const std::vector<CMutableTransaction>& txs = {})
+{
+    CBlock block;
+    block.vtx.push_back(MakeTransactionRef(Coinbase(coinbase_outputs)));
+    for (const CMutableTransaction& tx : txs) {
+        block.vtx.push_back(MakeTransactionRef(tx));
+    }
+    return block;
+}
+
+BlockDiff ConnectOk(const CBlock& block, const DrivechainState& state, const BlockContext& context)
+{
+    BlockDiff diff;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_REQUIRE(ConnectBlock(block, context, state, SHORT_THRESHOLDS, 0, diff, error));
+    return diff;
+}
+
+BlockError ConnectError(const CBlock& block, const DrivechainState& state, const BlockContext& context)
+{
+    BlockDiff diff;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_REQUIRE(!ConnectBlock(block, context, state, SHORT_THRESHOLDS, 0, diff, error));
+    return error;
+}
+
 M2AckSidechain M2(const Sidechain& proposal)
 {
     return M2AckSidechain{.slot = proposal.slot, .proposal_id = proposal.Id().description_hash};
@@ -315,7 +342,7 @@ BOOST_AUTO_TEST_CASE(error_strings_are_distinct)
         BlockError::M6_TREASURY_OUTPUT_COUNT, BlockError::M6_UNKNOWN_BUNDLE,
         BlockError::M6_INSUFFICIENT_VOTES, BlockError::BMM_REQUEST_NOT_ACCEPTED,
         BlockError::BMM_REQUEST_EXPIRED, BlockError::MULTIPLE_BMM_REQUESTS,
-        BlockError::STATE_MISMATCH,
+        BlockError::NO_COINBASE, BlockError::STATE_MISMATCH,
     };
     std::set<std::string> seen;
     for (const BlockError error : errors) {
@@ -1207,6 +1234,186 @@ BOOST_AUTO_TEST_CASE(a_transaction_that_is_not_a_request_is_left_alone)
     std::swap(shifted.vout[0], shifted.vout[1]);
     BOOST_CHECK(HandleM8(CTransaction{shifted}, &accepted, parent, slot, error));
     BOOST_CHECK(!slot.has_value());
+}
+
+BOOST_AUTO_TEST_CASE(blocks_below_the_activation_height_are_not_scanned)
+{
+    // Plain Bitcoin history. An output that happens to look like a message in
+    // a block from years ago stays an ordinary output forever.
+    DrivechainState state;
+    const CBlock block{MakeBlock({M1Script(1, "alpha")})};
+
+    BlockDiff diff;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_REQUIRE(ConnectBlock(block, BlockContext{.height = 99}, state, SHORT_THRESHOLDS,
+                               /*activation_height=*/100, diff, error));
+    BOOST_CHECK(diff.coinbase.msgs.empty());
+
+    BOOST_REQUIRE(ConnectBlock(block, BlockContext{.height = 100}, state, SHORT_THRESHOLDS,
+                               /*activation_height=*/100, diff, error));
+    BOOST_CHECK_EQUAL(diff.coinbase.msgs.size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(a_block_with_no_transactions_has_no_coinbase)
+{
+    DrivechainState state;
+    CBlock block;
+    BlockDiff diff;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_CHECK(!ConnectBlock(block, BlockContext{}, state, SHORT_THRESHOLDS, 0, diff, error));
+    BOOST_CHECK(error == BlockError::NO_COINBASE);
+}
+
+BOOST_AUTO_TEST_CASE(messages_see_the_effect_of_earlier_ones)
+{
+    // An M2 in the same coinbase as the M1 it acks must be ignored: BIP-300
+    // wants the proposal to sit in an ancestor block, and this is the ordering
+    // that makes the rule detectable at all.
+    DrivechainState state;
+    const Sidechain proposal{MakeProposal(1, "alpha", 500)};
+    const CBlock block{MakeBlock({
+        M1Script(1, "alpha"),
+        SlotAndHashScript(M2AckSidechain::TAG, 1, 0),
+    })};
+
+    // Build the M2 so it really does name the proposal.
+    CMutableTransaction coinbase{Coinbase({M1Script(1, "alpha")})};
+    std::vector<unsigned char> body{1};
+    const uint256 hash{proposal.Id().description_hash};
+    body.insert(body.end(), hash.begin(), hash.end());
+    coinbase.vout.emplace_back(0, MessageScript(M2AckSidechain::TAG, body));
+
+    CBlock same_block;
+    same_block.vtx.push_back(MakeTransactionRef(coinbase));
+
+    const BlockDiff diff{ConnectOk(same_block, state, BlockContext{.height = 500})};
+    // The M1 recorded a proposal; the M2 did not record an ack.
+    BOOST_REQUIRE_EQUAL(diff.coinbase.msgs.size(), 1U);
+    BOOST_CHECK(std::holds_alternative<NewSidechainProposal>(diff.coinbase.msgs[0]));
+}
+
+BOOST_AUTO_TEST_CASE(an_m4_can_vote_on_a_bundle_proposed_in_the_same_block)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+
+    CMutableTransaction coinbase{Coinbase({SlotAndHashScript(M3ProposeBundle::TAG, 1, 7)})};
+    coinbase.vout.emplace_back(0, M4Script({0x00}));
+    CBlock block;
+    block.vtx.push_back(MakeTransactionRef(coinbase));
+
+    const BlockDiff diff{ConnectOk(block, state, BlockContext{.height = 500})};
+    BOOST_REQUIRE_EQUAL(diff.coinbase.msgs.size(), 2U);
+
+    DrivechainState applied{state};
+    BOOST_REQUIRE(diff.Apply(applied, 500));
+    // Proposed at one ack, then upvoted by the M4 that follows it.
+    BOOST_REQUIRE_EQUAL(applied.GetPendingWithdrawals(1)->size(), 1U);
+    BOOST_CHECK_EQUAL(applied.GetPendingWithdrawals(1)->at(0).vote_count, 2);
+}
+
+BOOST_AUTO_TEST_CASE(a_bundle_proposed_this_block_is_not_aged_out_by_it)
+{
+    // Ageing runs after the messages, so a bundle proposed at this height is
+    // zero blocks old rather than old enough to have expired.
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+
+    const CBlock block{MakeBlock({SlotAndHashScript(M3ProposeBundle::TAG, 1, 7)})};
+    const BlockDiff diff{ConnectOk(block, state, BlockContext{.height = 100000})};
+    BOOST_CHECK(diff.coinbase.failed_bundles.removed.empty());
+
+    DrivechainState applied{state};
+    BOOST_REQUIRE(diff.Apply(applied, 100000));
+    BOOST_CHECK_EQUAL(applied.GetPendingWithdrawals(1)->size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(only_one_bmm_request_per_slot_per_block)
+{
+    // Otherwise a miner collects from several bidders while only one
+    // side:block can possibly be connected, and every other bidder pays for
+    // nothing. This is what makes blind merged mining trustless rather than
+    // reputational.
+    DrivechainState state;
+    const uint256 parent{uint256{77}};
+    const uint256 hash{uint256{11}};
+
+    CMutableTransaction coinbase{Coinbase({})};
+    std::vector<unsigned char> body{1};
+    body.insert(body.end(), hash.begin(), hash.end());
+    coinbase.vout.emplace_back(0, MessageScript(M7BmmAccept::TAG, body));
+
+    CBlock block;
+    block.vtx.push_back(MakeTransactionRef(coinbase));
+    block.vtx.push_back(MakeTransactionRef(M8Tx(1, hash, parent)));
+
+    const BlockContext context{.height = 500, .parent_hash = parent};
+    BOOST_CHECK_NO_THROW(ConnectOk(block, state, context));
+
+    // A second request for the same slot, naming the same accepted block.
+    block.vtx.push_back(MakeTransactionRef(M8Tx(1, hash, parent)));
+    BOOST_CHECK(ConnectError(block, state, context) == BlockError::MULTIPLE_BMM_REQUESTS);
+}
+
+BOOST_AUTO_TEST_CASE(a_request_without_an_accept_invalidates_the_block)
+{
+    DrivechainState state;
+    const uint256 parent{uint256{77}};
+
+    CBlock block{MakeBlock({}, {M8Tx(1, uint256{11}, parent)})};
+    BOOST_CHECK(ConnectError(block, state, BlockContext{.height = 500, .parent_hash = parent}) ==
+                BlockError::BMM_REQUEST_NOT_ACCEPTED);
+}
+
+BOOST_AUTO_TEST_CASE(a_whole_block_round_trips)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {});
+    const COutPoint treasury{GiveTreasury(state, 1, 10000)};
+
+    CMutableTransaction deposit;
+    deposit.vin.emplace_back(treasury);
+    deposit.vout.emplace_back(15000, TreasuryScript(1));
+    deposit.vout.emplace_back(0, AddressOutput());
+
+    CMutableTransaction coinbase{Coinbase({M1Script(2, "beta")})};
+    coinbase.vout.emplace_back(0, SlotAndHashScript(M3ProposeBundle::TAG, 1, 7));
+
+    CBlock block;
+    block.vtx.push_back(MakeTransactionRef(coinbase));
+    block.vtx.push_back(MakeTransactionRef(deposit));
+
+    const BlockDiff diff{ConnectOk(block, state, BlockContext{.height = 500})};
+    BOOST_CHECK_EQUAL(diff.coinbase.msgs.size(), 2U);
+    BOOST_CHECK_EQUAL(diff.txs.size(), 1U);
+
+    const DrivechainState before{state};
+    DrivechainState applied{state};
+    BOOST_REQUIRE(diff.Apply(applied, 500));
+    BOOST_CHECK_EQUAL(applied.GetCtip(1)->value, 15000);
+    BOOST_CHECK_EQUAL(applied.GetPendingWithdrawals(1)->size(), 1U);
+    BOOST_CHECK_EQUAL(applied.Proposals().size(), 1U);
+
+    UndoError undo_error{};
+    BOOST_REQUIRE(diff.Undo(applied, undo_error));
+    BOOST_CHECK(applied == before);
+}
+
+BOOST_AUTO_TEST_CASE(resolved_votes_are_what_a_repeat_replays)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {5});
+
+    CBlock block{MakeBlock({M4Script({0x00})})};
+    const BlockDiff diff{ConnectOk(block, state, BlockContext{.height = 500})};
+
+    const AckBundles resolved{ResolvedVotes(diff)};
+    BOOST_REQUIRE_EQUAL(resolved.actions.count(1), 1U);
+    BOOST_CHECK(resolved.actions.at(1).upvoted == BundleAt(state, 1, 0));
+
+    // A block with no M4 resolves to no votes, so a repeat of it casts none.
+    const BlockDiff quiet{ConnectOk(MakeBlock({}), state, BlockContext{.height = 501})};
+    BOOST_CHECK(ResolvedVotes(quiet).actions.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

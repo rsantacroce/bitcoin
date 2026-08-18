@@ -5,6 +5,7 @@
 #include <drivechain/validation.h>
 
 #include <drivechain/m6id.h>
+#include <primitives/block.h>
 #include <drivechain/messages.h>
 #include <drivechain/params.h>
 #include <drivechain/state.h>
@@ -184,6 +185,7 @@ std::string BlockErrorString(BlockError error)
     case BlockError::BMM_REQUEST_NOT_ACCEPTED: return "bad-drivechain-bmm-request-not-accepted";
     case BlockError::BMM_REQUEST_EXPIRED: return "bad-drivechain-bmm-request-expired";
     case BlockError::MULTIPLE_BMM_REQUESTS: return "bad-drivechain-multiple-bmm-requests";
+    case BlockError::NO_COINBASE: return "bad-drivechain-no-coinbase";
     case BlockError::STATE_MISMATCH: return "drivechain-state-mismatch";
     }
     return "bad-drivechain-unknown";
@@ -580,6 +582,129 @@ bool HandleM8(const CTransaction& tx,
     }
 
     slot = request->slot;
+    return true;
+}
+
+AckBundles ResolvedVotes(const BlockDiff& diff)
+{
+    // At most one M4 per block, so at most one of these.
+    for (const CoinbaseMsgDiff& msg : diff.coinbase.msgs) {
+        if (const auto* votes{std::get_if<AckBundles>(&msg)}) return *votes;
+    }
+    return AckBundles{};
+}
+
+bool ConnectBlock(const CBlock& block,
+                  const BlockContext& context,
+                  const DrivechainState& state,
+                  const Thresholds& thresholds,
+                  int32_t activation_height,
+                  BlockDiff& diff,
+                  BlockError& error)
+{
+    diff = BlockDiff{};
+
+    if (block.vtx.empty()) {
+        error = BlockError::NO_COINBASE;
+        return false;
+    }
+
+    // Everything below the activation height is plain Bitcoin history. It is
+    // recorded, but never scanned for messages or deposits, so an output that
+    // happens to look like a treasury in a block from 2013 stays an ordinary
+    // output forever.
+    if (context.height < activation_height) return true;
+
+    CoinbaseMessages coinbase;
+    if (!CollectCoinbaseMessages(*block.vtx[0], coinbase, error)) return false;
+
+    // Messages are applied as they are read, so a later message in the same
+    // coinbase sees what the earlier ones did. That is what makes an M2 unable
+    // to ack a proposal made in this very block, and what lets an M4 vote on a
+    // bundle an M3 has just proposed.
+    DrivechainState scratch{state};
+    const auto apply = [&](const CoinbaseMsgDiff& msg) {
+        BlockDiff single;
+        single.coinbase.msgs.push_back(msg);
+        if (!single.Apply(scratch, context.height)) return false;
+        diff.coinbase.msgs.push_back(msg);
+        return true;
+    };
+
+    for (const auto& [message, vout] : coinbase.messages) {
+        if (const auto* m1{std::get_if<M1ProposeSidechain>(&message)}) {
+            if (const auto proposal{HandleM1(*m1, scratch, context.height)}) {
+                if (!apply(*proposal)) { error = BlockError::STATE_MISMATCH; return false; }
+            }
+        } else if (const auto* m2{std::get_if<M2AckSidechain>(&message)}) {
+            if (const auto ack{HandleM2(*m2, scratch, thresholds, context.height)}) {
+                if (!apply(*ack)) { error = BlockError::STATE_MISMATCH; return false; }
+            }
+        } else if (const auto* m3{std::get_if<M3ProposeBundle>(&message)}) {
+            ProposeBundle bundle;
+            if (!HandleM3(*m3, scratch, bundle, error)) return false;
+            if (!apply(bundle)) { error = BlockError::STATE_MISMATCH; return false; }
+        } else if (const auto* m4{std::get_if<M4AckBundles>(&message)}) {
+            AckBundles votes;
+            if (!HandleM4(*m4, scratch, context.previous_votes, votes, error)) return false;
+            // An M4 that resolves to nothing -- all abstains, or a repeat of a
+            // block that voted on bundles now gone -- records no diff.
+            if (!votes.actions.empty() && !apply(votes)) { error = BlockError::STATE_MISMATCH; return false; }
+        }
+        // An M7 changes no state. It was collected above, and the requests in
+        // this block are checked against it below.
+    }
+
+    // A block with no M4 abstains for every slot, which changes nothing. The
+    // reference implementation reaches the same place by synthesising a vote
+    // array of abstains and resolving it; the result is an empty diff either
+    // way, and this says so rather than building one to throw away.
+
+    // Ageing follows the messages, so a bundle proposed in this block is not
+    // immediately expired by it.
+    diff.coinbase.failed_proposals = CollectFailedProposals(scratch, thresholds, context.height);
+    diff.coinbase.failed_bundles = CollectFailedBundles(scratch, thresholds, context.height);
+    {
+        BlockDiff ageing;
+        ageing.coinbase.failed_proposals = diff.coinbase.failed_proposals;
+        ageing.coinbase.failed_bundles = diff.coinbase.failed_bundles;
+        if (!ageing.Apply(scratch, context.height)) {
+            error = BlockError::STATE_MISMATCH;
+            return false;
+        }
+    }
+
+    // BIP-301: at most one request per slot may be accepted per block. Without
+    // it a miner could collect from several bidders while only one side:block
+    // can possibly be connected, so every other bidder pays for nothing.
+    std::set<SlotNum> requested_slots;
+
+    for (size_t i{1}; i < block.vtx.size(); ++i) {
+        const CTransaction& tx{*block.vtx[i]};
+
+        std::optional<TxDiff> tx_diff;
+        if (!HandleTreasuryTx(tx, scratch, thresholds, tx_diff, error)) return false;
+
+        std::optional<SlotNum> requested;
+        if (!HandleM8(tx, &coinbase.bmm_accepts, context.parent_hash, requested, error)) return false;
+        // Only a request that got this far is a valid one, so a repeat here is
+        // a second *valid* request for the slot rather than a second parse.
+        if (requested && !requested_slots.insert(*requested).second) {
+            error = BlockError::MULTIPLE_BMM_REQUESTS;
+            return false;
+        }
+
+        if (tx_diff) {
+            BlockDiff single;
+            single.txs.push_back(*tx_diff);
+            if (!single.Apply(scratch, context.height)) {
+                error = BlockError::STATE_MISMATCH;
+                return false;
+            }
+            diff.txs.push_back(*tx_diff);
+        }
+    }
+
     return true;
 }
 
