@@ -66,6 +66,7 @@ add_library(bitcoin_consensus STATIC EXCLUDE_FROM_ALL
   drivechain/m6id.cpp
   drivechain/messages.cpp
   drivechain/state.cpp
+  drivechain/validation.cpp
   hash.cpp
   primitives/block.cpp
   primitives/transaction.cpp

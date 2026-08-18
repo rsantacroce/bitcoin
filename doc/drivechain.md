@@ -63,9 +63,10 @@ follows that split:
 | `src/drivechain/diff.{h,cpp}` | what one block does to that state, and how to undo it |
 | `src/drivechain/db.{h,cpp}` | persistence for both |
 | `src/drivechain/params.{h,cpp}` | thresholds and activation, per network |
+| `src/drivechain/validation.{h,cpp}` | the rules a block must satisfy |
 
-Later phases add connect-time validation, the rest of mempool policy, and RPCs.
-This document grows with them.
+Later phases wire this into `ConnectBlock`, add the rest of mempool policy, and
+add the RPCs the external services need. This document grows with them.
 
 Everything under `src/drivechain/` is new code; the diff against upstream files
 is deliberately kept to a handful of call sites so that the patchset stays
@@ -111,6 +112,27 @@ blocks later. That is why the fuzz target lands here rather than at the end.
 Only regtest activates. Choosing a mainnet activation is a deployment decision
 nobody has made, and inventing a height here would be answering a question that
 has not been asked.
+
+**Phase 4** is the rule set: all 24 conditions under which a block is invalid,
+and the state transitions that go with them.
+
+14. collect and check coinbase messages
+15. M1 and M2 — the sidechain list
+16. ageing out proposals and bundles
+17. M3 — bundle proposals
+18. M4 — bundle votes
+19. M5 and M6 — deposits and withdrawals
+20. M7 and M8 — blind merged mining
+21. assembling them into a block check
+22. a fuzz target over whole blocks
+
+Nothing calls it yet: wiring it into `ConnectBlock` is the next phase, and it is
+kept separate so the rule set can be read and argued about on its own.
+
+The order the steps run in is load-bearing rather than incidental — coinbase
+messages are applied to a running state so a later one sees the earlier ones,
+ageing follows the messages, transactions follow both — and each consequence has
+a test rather than a comment.
 
 ## Notes for implementers
 

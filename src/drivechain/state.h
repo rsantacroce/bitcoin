@@ -153,6 +153,9 @@ public:
     PendingWithdrawals* ModifyPendingWithdrawals(SlotNum slot);
 
     const Ctip* GetCtip(SlotNum slot) const;
+    //! Every treasury pointer. A slot keeps its treasury even if its sidechain
+    //! stops being active, so this is not the same as iterating active slots.
+    const std::map<SlotNum, Ctip>& Ctips() const { return m_ctip; }
 
     void PutProposal(const Sidechain& sidechain);
     bool EraseProposal(const SidechainProposalId& id);
