@@ -64,19 +64,45 @@ follows that split:
 | `src/drivechain/db.{h,cpp}` | persistence for both |
 | `src/drivechain/params.{h,cpp}` | thresholds and activation, per network |
 | `src/drivechain/validation.{h,cpp}` | the rules a block must satisfy |
-
 | `src/rpc/drivechain.cpp` | read-only calls reporting the state |
 
 The chainstate owns a `DrivechainDB` beside its coins database, and
 `ConnectBlock` and `DisconnectBlock` take the sidechain state the way they take
 the coins view.
 
-What is still missing: the deposit sequence index and the two RPCs that read it,
-and a differential harness against the reference implementation.
+What is still missing: the deposit sequence index and the two RPCs that read it.
 
 Everything under `src/drivechain/` is new code; the diff against upstream files
 is deliberately kept to a handful of call sites so that the patchset stays
 reviewable and rebases cleanly across Core releases.
+
+## Dependencies
+
+**None.** `bitcoind` and `test_bitcoin` build and pass with no part of the
+drivechain ecosystem present, and no Rust toolchain installed.
+
+That is worth stating explicitly because the reference implementation is cited
+throughout this patchset, and a reader could reasonably wonder whether any of it
+is load-bearing at build or run time. It is not:
+
+- Everything in `src/drivechain/` includes Bitcoin Core headers and the C++
+  standard library, and nothing else.
+- The reference implementation is named only in comments, explaining why a rule
+  is what it is.
+- The build system does not reference `contrib/`, and never invokes `cargo`.
+- The differential test reads `src/test/data/drivechain_vectors.json`, a
+  committed data file, through the same mechanism Core already uses for
+  `script_tests.json` and `sighash.json`. It is data, not a dependency.
+
+The one place the reference implementation is used is
+`contrib/drivechain-vectors`, a standalone tool that regenerates that data file.
+Nothing builds it and nothing links it. Delete the directory and the node and its
+entire test suite still build and pass; the only thing lost is the ability to
+refresh the vectors.
+
+The direction of the arrow matters here. This implementation is checked *against*
+the reference implementation. It does not depend *on* it, and there is no code
+path, include, or build rule by which it could start to.
 
 ## Reviewing
 
