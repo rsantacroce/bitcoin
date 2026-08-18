@@ -37,22 +37,21 @@ class DrivechainDB
 public:
     explicit DrivechainDB(DBParams params) : m_db{std::move(params)} {}
 
-    //! Read the persisted state and the hash of the block it reflects.
+    //! Read the persisted state, which carries the block it describes.
     //! Returns false if nothing has been written yet, which is the normal
     //! state of a fresh datadir.
-    bool ReadState(DrivechainState& state, uint256& tip) const;
+    bool ReadState(DrivechainState& state) const;
 
     //! Read the diff produced by connecting `block_hash`.
     bool ReadBlockDiff(const uint256& block_hash, BlockDiff& diff) const;
 
     /**
-     * Write the state, the block it reflects, and any diffs to store or drop,
-     * as one atomic batch.
+     * Write the state and any diffs to store or drop, as one atomic batch.
      *
-     * Atomicity is the point. If the state could reach disk without the diff
-     * that undoes it -- or at a different height than the chainstate -- an
-     * unclean shutdown would leave a node that cannot tell which of its
-     * databases to believe.
+     * Atomicity is the point. The state names the block it describes, so a
+     * reader can always tell where it is; what it must never find is a state
+     * whose block has no stored diff, because then that block cannot be
+     * disconnected.
      *
      * Set `fsync` for a flush that must survive a power loss, as CDBWrapper
      * users do. A write failure raises dbwrapper_error rather than returning,
@@ -60,7 +59,6 @@ public:
      * write.
      */
     void Flush(const DrivechainState& state,
-               const uint256& tip,
                const std::map<uint256, BlockDiff>& store_diffs = {},
                const std::vector<uint256>& erase_diffs = {},
                bool fsync = false);

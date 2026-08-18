@@ -16,19 +16,14 @@
 
 namespace drivechain {
 namespace {
-//! The whole BIP-300 state.
+//! The whole BIP-300 state, which names the block it describes.
 constexpr uint8_t DB_STATE{'S'};
-//! Hash of the block the stored state reflects.
-constexpr uint8_t DB_TIP{'T'};
 //! Per-block undo data, keyed by block hash.
 constexpr uint8_t DB_BLOCK_DIFF{'D'};
 } // namespace
 
-bool DrivechainDB::ReadState(DrivechainState& state, uint256& tip) const
+bool DrivechainDB::ReadState(DrivechainState& state) const
 {
-    // Both or neither. A state without the block it belongs to cannot be used,
-    // since there is no way to tell what still needs connecting.
-    if (!m_db.Read(DB_TIP, tip)) return false;
     return m_db.Read(DB_STATE, state);
 }
 
@@ -38,14 +33,12 @@ bool DrivechainDB::ReadBlockDiff(const uint256& block_hash, BlockDiff& diff) con
 }
 
 void DrivechainDB::Flush(const DrivechainState& state,
-                         const uint256& tip,
                          const std::map<uint256, BlockDiff>& store_diffs,
                          const std::vector<uint256>& erase_diffs,
                          bool fsync)
 {
     CDBBatch batch{m_db};
     batch.Write(DB_STATE, state);
-    batch.Write(DB_TIP, tip);
     for (const auto& [block_hash, diff] : store_diffs) {
         batch.Write(std::make_pair(DB_BLOCK_DIFF, block_hash), diff);
     }
