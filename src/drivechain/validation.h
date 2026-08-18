@@ -112,6 +112,29 @@ std::optional<AckSidechainProposal> HandleM2(const M2AckSidechain& m2,
                                              const Thresholds& thresholds,
                                              int32_t height);
 
+/**
+ * Proposals that run out at this height.
+ *
+ * A proposal fails when its age exceeds the window it had, and -- following the
+ * reference implementation rather than the specification -- also once it has
+ * missed enough blocks that it can no longer reach the threshold inside the
+ * window remaining. See Thresholds::ProposalFailed.
+ *
+ * BIP-300, "M2 — ACK Sidechain Proposal", Activation.
+ */
+FailedProposals CollectFailedProposals(const DrivechainState& state, const Thresholds& thresholds, int32_t height);
+
+/**
+ * Withdrawal bundles that age out at this height.
+ *
+ * An expired bundle is removed and pays nothing. Each is recorded with the
+ * position it held, because an M4 votes for a bundle by position and undo has
+ * to put it back where it was.
+ *
+ * BIP-300, "D2 — The Withdrawal List".
+ */
+FailedBundles CollectFailedBundles(const DrivechainState& state, const Thresholds& thresholds, int32_t height);
+
 } // namespace drivechain
 
 #endif // BITCOIN_DRIVECHAIN_VALIDATION_H

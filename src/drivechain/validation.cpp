@@ -142,4 +142,35 @@ std::optional<AckSidechainProposal> HandleM2(const M2AckSidechain& m2,
     return ack;
 }
 
+FailedProposals CollectFailedProposals(const DrivechainState& state, const Thresholds& thresholds, int32_t height)
+{
+    FailedProposals failed;
+    for (const auto& [id, proposal] : state.Proposals()) {
+        const int32_t age{std::max(0, height - proposal.proposal_height)};
+        if (thresholds.ProposalFailed(proposal.vote_count, age, state.IsActive(proposal.slot))) {
+            failed.removed.push_back(proposal);
+        }
+    }
+    return failed;
+}
+
+FailedBundles CollectFailedBundles(const DrivechainState& state, const Thresholds& thresholds, int32_t height)
+{
+    FailedBundles failed;
+    for (const SlotNum slot : state.ActiveSlots()) {
+        const PendingWithdrawals* pending{state.GetPendingWithdrawals(slot)};
+        // Every active slot has a withdrawal list; ActivateSidechain creates
+        // one and nothing else removes it.
+        if (pending == nullptr) continue;
+
+        for (uint32_t index{0}; index < pending->size(); ++index) {
+            const int32_t age{std::max(0, height - (*pending)[index].proposal_height)};
+            if (thresholds.BundleExpired(age)) {
+                failed.removed[slot][index] = (*pending)[index];
+            }
+        }
+    }
+    return failed;
+}
+
 } // namespace drivechain

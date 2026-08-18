@@ -343,4 +343,117 @@ BOOST_AUTO_TEST_CASE(m2_ack_applied_to_state_matches_what_it_says)
     BOOST_CHECK(state == before);
 }
 
+BOOST_AUTO_TEST_CASE(proposals_fail_when_their_window_closes)
+{
+    DrivechainState state;
+    Sidechain acked_every_block{MakeProposal(1, "alpha", 0)};
+    acked_every_block.vote_count = 2016;
+    state.PutProposal(acked_every_block);
+
+    // Alive at the last block of its window, gone one block later.
+    BOOST_CHECK(CollectFailedProposals(state, MAINNET_THRESHOLDS, 2016).removed.empty());
+    BOOST_CHECK_EQUAL(CollectFailedProposals(state, MAINNET_THRESHOLDS, 2017).removed.size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(proposals_fail_once_they_cannot_win)
+{
+    // The rule that is in the reference implementation and in neither
+    // specification: a proposal that has missed more blocks than its window
+    // can spare is done, without waiting for the window to close.
+    DrivechainState state;
+    Sidechain neglected{MakeProposal(1, "alpha", 0)};
+    neglected.vote_count = 100;
+    state.PutProposal(neglected);
+
+    // 201 missed blocks is one too many for a 2016 window with an 1815 bar.
+    BOOST_CHECK(CollectFailedProposals(state, MAINNET_THRESHOLDS, 300).removed.empty());
+    BOOST_CHECK_EQUAL(CollectFailedProposals(state, MAINNET_THRESHOLDS, 301).removed.size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(a_proposal_for_an_occupied_slot_gets_the_longer_window)
+{
+    // Overwriting an occupied slot is measured against 26300 blocks, not the
+    // 2016 an empty slot allows, so the same proposal survives far longer.
+    DrivechainState state;
+    Sidechain incumbent{MakeProposal(1, "alpha", 0)};
+    incumbent.activation_height = 10;
+    state.ActivateSidechain(incumbent);
+
+    Sidechain challenger{MakeProposal(1, "beta", 0)};
+    challenger.vote_count = 5000;
+    state.PutProposal(challenger);
+
+    BOOST_CHECK(CollectFailedProposals(state, MAINNET_THRESHOLDS, 5000).removed.empty());
+
+    // The same proposal in an empty slot would be long gone by then.
+    DrivechainState empty_slot;
+    empty_slot.PutProposal(challenger);
+    BOOST_CHECK_EQUAL(CollectFailedProposals(empty_slot, MAINNET_THRESHOLDS, 5000).removed.size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(bundles_age_out_with_their_positions_recorded)
+{
+    DrivechainState state;
+    Sidechain sidechain{MakeProposal(1, "alpha", 0)};
+    sidechain.activation_height = 0;
+    state.ActivateSidechain(sidechain);
+
+    // Three bundles proposed at different heights, so they expire in turn.
+    for (const int32_t proposed_at : {0, 100, 200}) {
+        state.ModifyPendingWithdrawals(1)->push_back(PendingWithdrawal{
+            .m6id = Txid::FromUint256(uint256{static_cast<uint8_t>(proposed_at / 100 + 1)}),
+            .vote_count = 1,
+            .proposal_height = proposed_at,
+        });
+    }
+
+    // Nothing has aged out at exactly the maximum age of the oldest.
+    BOOST_CHECK(CollectFailedBundles(state, MAINNET_THRESHOLDS, 26300).removed.empty());
+
+    // One block later the oldest is gone, and it is recorded at index 0.
+    const FailedBundles first{CollectFailedBundles(state, MAINNET_THRESHOLDS, 26301)};
+    BOOST_REQUIRE_EQUAL(first.removed.count(1), 1U);
+    BOOST_REQUIRE_EQUAL(first.removed.at(1).size(), 1U);
+    BOOST_CHECK_EQUAL(first.removed.at(1).begin()->first, 0U);
+
+    // Later still, two of them, at the positions they actually hold. An M4
+    // votes by position, so undo needs the index rather than the identity.
+    const FailedBundles second{CollectFailedBundles(state, MAINNET_THRESHOLDS, 26401)};
+    BOOST_REQUIRE_EQUAL(second.removed.at(1).size(), 2U);
+    BOOST_CHECK_EQUAL(second.removed.at(1).count(0), 1U);
+    BOOST_CHECK_EQUAL(second.removed.at(1).count(1), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(expiry_round_trips_through_the_diff)
+{
+    DrivechainState state;
+    Sidechain sidechain{MakeProposal(1, "alpha", 0)};
+    sidechain.activation_height = 0;
+    state.ActivateSidechain(sidechain);
+    for (uint8_t seed{1}; seed <= 3; ++seed) {
+        state.ModifyPendingWithdrawals(1)->push_back(PendingWithdrawal{
+            .m6id = Txid::FromUint256(uint256{seed}),
+            .vote_count = seed,
+            .proposal_height = seed == 2 ? 100000 : 0,
+        });
+    }
+    Sidechain doomed{MakeProposal(2, "beta", 0)};
+    state.PutProposal(doomed);
+
+    BlockDiff block;
+    block.coinbase.failed_proposals = CollectFailedProposals(state, MAINNET_THRESHOLDS, 100000);
+    block.coinbase.failed_bundles = CollectFailedBundles(state, MAINNET_THRESHOLDS, 100000);
+
+    const DrivechainState before{state};
+    BOOST_REQUIRE(block.Apply(state, 100000));
+    // The two at index 0 and 2 aged out; the one proposed at 100000 did not.
+    BOOST_REQUIRE_EQUAL(state.GetPendingWithdrawals(1)->size(), 1U);
+    BOOST_CHECK(state.GetPendingWithdrawals(1)->at(0).m6id == Txid::FromUint256(uint256{2}));
+    BOOST_CHECK(state.Proposals().empty());
+
+    UndoError undo_error{};
+    BOOST_REQUIRE(block.Undo(state, undo_error));
+    BOOST_CHECK(state == before);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
