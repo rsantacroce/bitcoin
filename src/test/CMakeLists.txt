@@ -44,6 +44,7 @@ add_executable(test_bitcoin
   disconnected_transactions.cpp
   drivechain_m6id_tests.cpp
   drivechain_messages_tests.cpp
+  drivechain_state_tests.cpp
   feefrac_tests.cpp
   feerounder_tests.cpp
   flatfile_tests.cpp
