@@ -203,7 +203,9 @@ bool UndoMsg(const AckBundles& diff, DrivechainState& state, UndoError& error)
 bool ApplyFailedProposals(const FailedProposals& diff, DrivechainState& state)
 {
     for (const Sidechain& proposal : diff.removed) {
-        state.EraseProposal(proposal.Id());
+        // Strict: undo puts every listed proposal back, so listing one that was
+        // not there would conjure it into existence on a reorg.
+        if (!state.EraseProposal(proposal.Id())) return false;
     }
     return true;
 }

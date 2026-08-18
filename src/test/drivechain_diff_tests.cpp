@@ -401,4 +401,15 @@ BOOST_AUTO_TEST_CASE(whole_block_round_trip)
     CheckRoundTrip(diff, state);
 }
 
+BOOST_AUTO_TEST_CASE(failing_a_proposal_that_is_not_there_is_refused)
+{
+    // Undo puts every listed proposal back, so applying a diff that names one
+    // the state does not hold would conjure it into existence on a reorg.
+    BlockDiff diff;
+    diff.coinbase.failed_proposals.removed.push_back(MakeProposal(SLOT, "alpha"));
+
+    DrivechainState state;
+    BOOST_CHECK(!diff.Apply(state, HEIGHT));
+}
+
 BOOST_AUTO_TEST_SUITE_END()
