@@ -204,7 +204,8 @@ BOOST_AUTO_TEST_CASE(error_strings_are_distinct)
     // missing string would make two different failures indistinguishable.
     const std::vector<BlockError> errors{
         BlockError::DUPLICATE_M1, BlockError::DUPLICATE_M2, BlockError::DUPLICATE_M4,
-        BlockError::DUPLICATE_M7, BlockError::STATE_MISMATCH,
+        BlockError::DUPLICATE_M7, BlockError::M3_INACTIVE_SIDECHAIN,
+        BlockError::M3_BUNDLE_ALREADY_PENDING, BlockError::STATE_MISMATCH,
     };
     std::set<std::string> seen;
     for (const BlockError error : errors) {
@@ -450,6 +451,82 @@ BOOST_AUTO_TEST_CASE(expiry_round_trips_through_the_diff)
     BOOST_REQUIRE_EQUAL(state.GetPendingWithdrawals(1)->size(), 1U);
     BOOST_CHECK(state.GetPendingWithdrawals(1)->at(0).m6id == Txid::FromUint256(uint256{2}));
     BOOST_CHECK(state.Proposals().empty());
+
+    UndoError undo_error{};
+    BOOST_REQUIRE(block.Undo(state, undo_error));
+    BOOST_CHECK(state == before);
+}
+
+BOOST_AUTO_TEST_CASE(m3_needs_an_active_sidechain)
+{
+    DrivechainState state;
+    ProposeBundle diff;
+    BlockError error{BlockError::STATE_MISMATCH};
+
+    // A slot with nothing in it.
+    BOOST_CHECK(!HandleM3(M3ProposeBundle{.slot = 1, .m6id = Txid::FromUint256(uint256{7})}, state, diff, error));
+    BOOST_CHECK(error == BlockError::M3_INACTIVE_SIDECHAIN);
+
+    // A slot with a proposal in it is still not an active sidechain.
+    state.PutProposal(MakeProposal(1, "alpha", 0));
+    BOOST_CHECK(!HandleM3(M3ProposeBundle{.slot = 1, .m6id = Txid::FromUint256(uint256{7})}, state, diff, error));
+    BOOST_CHECK(error == BlockError::M3_INACTIVE_SIDECHAIN);
+
+    Sidechain sidechain{MakeProposal(1, "alpha", 0)};
+    sidechain.activation_height = 10;
+    state.ActivateSidechain(sidechain);
+    BOOST_CHECK(HandleM3(M3ProposeBundle{.slot = 1, .m6id = Txid::FromUint256(uint256{7})}, state, diff, error));
+    BOOST_CHECK_EQUAL(int{diff.slot}, 1);
+    BOOST_CHECK(diff.m6id == Txid::FromUint256(uint256{7}));
+}
+
+BOOST_AUTO_TEST_CASE(m3_cannot_re_propose_a_pending_bundle)
+{
+    // Re-proposing would reset the bundle's ack count and its expiry clock,
+    // so it invalidates the block rather than being ignored.
+    DrivechainState state;
+    Sidechain sidechain{MakeProposal(1, "alpha", 0)};
+    sidechain.activation_height = 10;
+    state.ActivateSidechain(sidechain);
+    state.ModifyPendingWithdrawals(1)->push_back(PendingWithdrawal{
+        .m6id = Txid::FromUint256(uint256{7}), .vote_count = 900, .proposal_height = 20});
+
+    ProposeBundle diff;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_CHECK(!HandleM3(M3ProposeBundle{.slot = 1, .m6id = Txid::FromUint256(uint256{7})}, state, diff, error));
+    BOOST_CHECK(error == BlockError::M3_BUNDLE_ALREADY_PENDING);
+
+    // A different bundle in the same slot is fine.
+    BOOST_CHECK(HandleM3(M3ProposeBundle{.slot = 1, .m6id = Txid::FromUint256(uint256{8})}, state, diff, error));
+
+    // And the same bundle once it is no longer pending. BIP-300 deliberately
+    // does not blacklist a bundle that expired or was paid out: one that
+    // expired through miner apathy would otherwise strand its withdrawals
+    // forever.
+    state.ModifyPendingWithdrawals(1)->clear();
+    BOOST_CHECK(HandleM3(M3ProposeBundle{.slot = 1, .m6id = Txid::FromUint256(uint256{7})}, state, diff, error));
+}
+
+BOOST_AUTO_TEST_CASE(a_proposed_bundle_starts_with_one_ack)
+{
+    DrivechainState state;
+    Sidechain sidechain{MakeProposal(1, "alpha", 0)};
+    sidechain.activation_height = 10;
+    state.ActivateSidechain(sidechain);
+
+    ProposeBundle diff;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_REQUIRE(HandleM3(M3ProposeBundle{.slot = 1, .m6id = Txid::FromUint256(uint256{7})}, state, diff, error));
+
+    BlockDiff block;
+    block.coinbase.msgs.push_back(diff);
+    const DrivechainState before{state};
+    BOOST_REQUIRE(block.Apply(state, 500));
+
+    BOOST_REQUIRE_EQUAL(state.GetPendingWithdrawals(1)->size(), 1U);
+    // Being proposed counts as the bundle's first upvote.
+    BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(1)->at(0).vote_count, 1);
+    BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(1)->at(0).proposal_height, 500);
 
     UndoError undo_error{};
     BOOST_REQUIRE(block.Undo(state, undo_error));

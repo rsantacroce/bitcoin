@@ -39,6 +39,11 @@ enum class BlockError {
     DUPLICATE_M4,
     //! Two M7s accepting a block for the same slot.
     DUPLICATE_M7,
+    //! An M3 proposing a bundle for a slot that holds no sidechain.
+    M3_INACTIVE_SIDECHAIN,
+    //! An M3 proposing a bundle that is already pending. Allowing it would
+    //! reset the bundle's ack count and its clock.
+    M3_BUNDLE_ALREADY_PENDING,
     //! The state does not contain what a diff built against it expects. A bug
     //! or corruption, not a bad block.
     STATE_MISMATCH,
@@ -134,6 +139,23 @@ FailedProposals CollectFailedProposals(const DrivechainState& state, const Thres
  * BIP-300, "D2 — The Withdrawal List".
  */
 FailedBundles CollectFailedBundles(const DrivechainState& state, const Thresholds& thresholds, int32_t height);
+
+/**
+ * Handle an M3: propose a withdrawal bundle.
+ *
+ * Unlike M1 and M2, an M3 can make the block invalid: for a slot that holds no
+ * sidechain, and for a bundle that is already pending. The second is what stops
+ * a re-proposal resetting an accumulated ack count and expiry clock.
+ *
+ * A bundle that is no longer pending -- paid out or expired -- may be proposed
+ * again, starting a fresh count. BIP-300 deliberately does not blacklist it: a
+ * bundle that expired through miner apathy would otherwise strand its
+ * withdrawals forever, and one that was paid out cannot be paid twice, since
+ * the treasury output it spent no longer exists.
+ *
+ * BIP-300, "M3 — Propose Bundle".
+ */
+[[nodiscard]] bool HandleM3(const M3ProposeBundle& m3, const DrivechainState& state, ProposeBundle& out, BlockError& error);
 
 } // namespace drivechain
 

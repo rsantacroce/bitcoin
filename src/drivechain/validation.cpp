@@ -27,6 +27,8 @@ std::string BlockErrorString(BlockError error)
     case BlockError::DUPLICATE_M2: return "bad-drivechain-duplicate-m2";
     case BlockError::DUPLICATE_M4: return "bad-drivechain-duplicate-m4";
     case BlockError::DUPLICATE_M7: return "bad-drivechain-duplicate-m7";
+    case BlockError::M3_INACTIVE_SIDECHAIN: return "bad-drivechain-m3-inactive-sidechain";
+    case BlockError::M3_BUNDLE_ALREADY_PENDING: return "bad-drivechain-m3-bundle-already-pending";
     case BlockError::STATE_MISMATCH: return "drivechain-state-mismatch";
     }
     return "bad-drivechain-unknown";
@@ -171,6 +173,25 @@ FailedBundles CollectFailedBundles(const DrivechainState& state, const Threshold
         }
     }
     return failed;
+}
+
+bool HandleM3(const M3ProposeBundle& m3, const DrivechainState& state, ProposeBundle& out, BlockError& error)
+{
+    const PendingWithdrawals* pending{state.GetPendingWithdrawals(m3.slot)};
+    if (pending == nullptr) {
+        error = BlockError::M3_INACTIVE_SIDECHAIN;
+        return false;
+    }
+
+    for (const PendingWithdrawal& bundle : *pending) {
+        if (bundle.m6id == m3.m6id) {
+            error = BlockError::M3_BUNDLE_ALREADY_PENDING;
+            return false;
+        }
+    }
+
+    out = ProposeBundle{.slot = m3.slot, .m6id = m3.m6id};
+    return true;
 }
 
 } // namespace drivechain
