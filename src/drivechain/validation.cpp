@@ -277,6 +277,16 @@ std::optional<AckSidechainProposal> HandleM2(const M2AckSidechain& m2,
     // proposal acked in the block that proposed it still has this height.
     if (proposal->proposal_height == height) return std::nullopt;
 
+    // A saturated count casts no vote rather than wrapping to zero. Ageing
+    // bounds a live proposal's count by its window -- 26300 blocks at most,
+    // well short of the 65535 a wrap needs -- so this cannot arise from a chain
+    // that was validated block by block. It can arise from a state loaded off
+    // disk, and the failure mode is bad enough to be worth the two lines: the
+    // count wraps to zero, and undoing the ack then underflows, which leaves a
+    // block that has been connected and can never be disconnected. The same
+    // rule already applies to bundle votes.
+    if (proposal->vote_count == std::numeric_limits<uint16_t>::max()) return std::nullopt;
+
     const uint16_t vote_count{static_cast<uint16_t>(proposal->vote_count + 1)};
     // Saturating: a proposal held over from a previous sync may sit above the
     // current height, and an age that wrapped would silently never activate.

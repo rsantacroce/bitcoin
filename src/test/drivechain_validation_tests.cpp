@@ -409,6 +409,26 @@ BOOST_AUTO_TEST_CASE(m2_cannot_ack_a_proposal_made_in_the_same_block)
     BOOST_CHECK(HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 501).has_value());
 }
 
+BOOST_AUTO_TEST_CASE(m2_for_a_saturated_proposal_casts_no_vote)
+{
+    // Incrementing a count already at the maximum wraps it to zero, and
+    // undoing the ack then underflows -- which leaves a block that has been
+    // connected and can never be disconnected. Ageing keeps a live proposal
+    // far below this, so it takes a state loaded off disk to get here, but the
+    // failure is bad enough to refuse rather than reason about.
+    DrivechainState state;
+    Sidechain proposal{MakeProposal(1, "alpha", 0)};
+    proposal.vote_count = std::numeric_limits<uint16_t>::max();
+    state.PutProposal(proposal);
+
+    BOOST_CHECK(!HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 500).has_value());
+
+    // One below the maximum still votes.
+    proposal.vote_count = std::numeric_limits<uint16_t>::max() - 1;
+    state.PutProposal(proposal);
+    BOOST_CHECK(HandleM2(M2(proposal), state, MAINNET_THRESHOLDS, 500).has_value());
+}
+
 BOOST_AUTO_TEST_CASE(m2_activates_an_empty_slot_at_the_bar)
 {
     DrivechainState state;
