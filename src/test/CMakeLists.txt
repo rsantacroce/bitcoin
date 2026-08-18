@@ -50,6 +50,7 @@ add_executable(test_bitcoin
   drivechain_policy_tests.cpp
   drivechain_state_tests.cpp
   drivechain_validation_tests.cpp
+  drivechain_vectors_tests.cpp
   feefrac_tests.cpp
   feerounder_tests.cpp
   flatfile_tests.cpp
@@ -152,6 +153,7 @@ target_json_data_sources(test_bitcoin
   data/base58_encode_decode.json
   data/bip341_wallet_vectors.json
   data/blockfilters.json
+  data/drivechain_vectors.json
   data/key_io_invalid.json
   data/key_io_valid.json
   data/script_tests.json
