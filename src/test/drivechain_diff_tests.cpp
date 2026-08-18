@@ -6,12 +6,15 @@
 #include <drivechain/messages.h>
 #include <drivechain/state.h>
 #include <primitives/transaction.h>
+#include <serialize.h>
+#include <streams.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <cstring>
+#include <ios>
 #include <string>
 #include <vector>
 
@@ -401,6 +404,56 @@ BOOST_AUTO_TEST_CASE(whole_block_round_trip)
     CheckRoundTrip(diff, state);
 }
 
+BOOST_AUTO_TEST_CASE(serialization_survives_a_full_block)
+{
+    DrivechainState state;
+    const Sidechain proposal{MakeProposal(SLOT, "alpha")};
+    const Sidechain doomed{MakeProposal(3, "gamma")};
+    state.PutProposal(proposal);
+    state.PutProposal(doomed);
+
+    BlockDiff diff;
+    diff.coinbase.msgs.push_back(AckSidechainProposal{
+        .id = proposal.Id(),
+        .effect = AckSidechainProposal::Effect::SLOT_ACTIVATION,
+    });
+    diff.coinbase.msgs.push_back(ProposeBundle{.slot = SLOT, .m6id = BundleId(1)});
+    diff.coinbase.msgs.push_back(ProposeBundle{.slot = SLOT, .m6id = BundleId(2)});
+    AckBundles ack;
+    ack.actions[SLOT] = AckBundles::Action{
+        .kind = AckBundles::Action::Kind::UPVOTE,
+        .upvoted = BundleId(1),
+        .downvoted = {BundleId(2)},
+    };
+    diff.coinbase.msgs.push_back(ack);
+    diff.coinbase.msgs.push_back(NewSidechainProposal{.sidechain = MakeProposal(2, "beta")});
+    diff.coinbase.failed_proposals.removed.push_back(doomed);
+    diff.coinbase.failed_bundles.removed[SLOT] = {};
+    M5Diff m5;
+    m5.ctips[SLOT] = TreasuryChange{.new_ctip = MakeCtip(1, 1000), .had_previous = false};
+    diff.txs.push_back(m5);
+
+    DataStream stream;
+    stream << diff;
+    BlockDiff restored;
+    stream >> restored;
+    BOOST_CHECK(stream.empty());
+
+    // The diff types have no equality operator, and comparing them field by
+    // field would only test the comparison. Compare what they *do* instead:
+    // applied to the same state, they must produce the same state, and the
+    // restored one must still undo cleanly.
+    DrivechainState from_original{state};
+    DrivechainState from_restored{state};
+    BOOST_REQUIRE(diff.Apply(from_original, HEIGHT));
+    BOOST_REQUIRE(restored.Apply(from_restored, HEIGHT));
+    BOOST_CHECK(from_original == from_restored);
+
+    UndoError error{};
+    BOOST_REQUIRE(restored.Undo(from_restored, error));
+    BOOST_CHECK(from_restored == state);
+}
+
 BOOST_AUTO_TEST_CASE(failing_a_proposal_that_is_not_there_is_refused)
 {
     // Undo puts every listed proposal back, so applying a diff that names one
@@ -410,6 +463,33 @@ BOOST_AUTO_TEST_CASE(failing_a_proposal_that_is_not_there_is_refused)
 
     DrivechainState state;
     BOOST_CHECK(!diff.Apply(state, HEIGHT));
+}
+
+BOOST_AUTO_TEST_CASE(serialization_rejects_corrupt_data)
+{
+    // The discriminator is a variant index, so a byte from disk that names no
+    // alternative must be an error rather than an out-of-range construction.
+    {
+        DataStream stream;
+        WriteCompactSize(stream, 1);
+        stream << uint8_t{99};
+        std::vector<CoinbaseMsgDiff> msgs;
+        BOOST_CHECK_THROW(stream >> msgs, std::ios_base::failure);
+    }
+
+    // Same for an enum read back from a byte outside its range.
+    {
+        DataStream stream;
+        stream << SidechainProposalId{} << uint8_t{9} << Sidechain{};
+        AckSidechainProposal ack;
+        BOOST_CHECK_THROW(stream >> ack, std::ios_base::failure);
+    }
+    {
+        DataStream stream;
+        stream << uint8_t{7} << BundleId(1) << std::vector<Txid>{};
+        AckBundles::Action action;
+        BOOST_CHECK_THROW(stream >> action, std::ios_base::failure);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
