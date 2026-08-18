@@ -65,8 +65,12 @@ follows that split:
 | `src/drivechain/params.{h,cpp}` | thresholds and activation, per network |
 | `src/drivechain/validation.{h,cpp}` | the rules a block must satisfy |
 
-Later phases wire this into `ConnectBlock`, add the rest of mempool policy, and
-add the RPCs the external services need. This document grows with them.
+The chainstate owns a `DrivechainDB` beside its coins database, and
+`ConnectBlock` and `DisconnectBlock` take the sidechain state the way they take
+the coins view.
+
+Later phases add the rest of mempool policy and the RPCs the external services
+need. This document grows with them.
 
 Everything under `src/drivechain/` is new code; the diff against upstream files
 is deliberately kept to a handful of call sites so that the patchset stays
@@ -133,6 +137,31 @@ The order the steps run in is load-bearing rather than incidental — coinbase
 messages are applied to a running state so a later one sees the earlier ones,
 ageing follows the messages, transactions follow both — and each consequence has
 a test rather than a comment.
+
+**Phase 5** puts it in the chainstate, where a block that breaks a rule is
+rejected before it can be connected.
+
+23. the state carries the block it describes
+24. regtest chooses its activation height
+25. enforcement in `ConnectBlock` and `DisconnectBlock`
+26. a functional test
+
+Nothing activates by default on any network, regtest included. A test turns the
+rules on with `-testactivationheight=drivechain@N`, the way it turns on segwit.
+
+**The state is a parameter, not a member of the chainstate**, and that is the
+part most likely to be undone by accident. Core connects and disconnects blocks
+in places that are not the tip — `VerifyDB` unwinds and replays at startup, and
+the coins database may lag the chain and be caught up by `ReplayBlocks` — so
+those callers hand over a scratch copy, exactly as they already do for coins. A
+state read off the chainstate in those paths would be asked to undo a block it
+never applied. It carries the block it describes so each caller can tell whether
+it is in a position to act at all; when it is not, the sidechain work is skipped
+rather than guessed at.
+
+A chainstate loaded from a UTXO snapshot describes no block, so these rules are
+not enforced on it: it has no history to derive the state from and the snapshot
+carries none. Its blocks are validated by the background chainstate, which does.
 
 ## Notes for implementers
 
