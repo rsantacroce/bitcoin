@@ -141,9 +141,10 @@ blocks later. That is why the fuzz target lands here rather than at the end.
 12. relaying spends of treasury outputs
 13. relaying creation of treasury outputs
 
-Only regtest activates. Choosing a mainnet activation is a deployment decision
+Nothing activates by default. Choosing an activation is a deployment decision
 nobody has made, and inventing a height here would be answering a question that
-has not been asked.
+has not been asked. Phase 5 makes regtest opt in with
+`-testactivationheight=drivechain@N`.
 
 **Phase 4** is the rule set: all 24 conditions under which a block is invalid,
 and the state transitions that go with them.
