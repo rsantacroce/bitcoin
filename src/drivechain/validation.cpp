@@ -12,13 +12,150 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
+#include <ranges>
+#include <utility>
+#include <vector>
 #include <set>
 #include <string>
 #include <variant>
 
 namespace drivechain {
+namespace {
+//! Bundles in a slot that would actually lose a vote, meaning those above zero.
+//!
+//! Recording only these is what keeps apply and undo exact inverses: a bundle
+//! already at zero stays at zero when downvoted, so undo must not hand it a
+//! vote back.
+std::vector<Txid> Downvoted(const PendingWithdrawals& pending, const Txid* except)
+{
+    std::vector<Txid> downvoted;
+    for (const PendingWithdrawal& bundle : pending) {
+        if (bundle.vote_count == 0) continue;
+        if (except != nullptr && bundle.m6id == *except) continue;
+        downvoted.push_back(bundle.m6id);
+    }
+    return downvoted;
+}
+
+//! Build the upvote action for a bundle, or nothing if it cannot take a vote.
+std::optional<AckBundles::Action> Upvote(const PendingWithdrawals& pending, const PendingWithdrawal& target)
+{
+    // A saturated count silently casts no vote rather than overflowing.
+    if (target.vote_count == std::numeric_limits<uint16_t>::max()) return std::nullopt;
+    return AckBundles::Action{
+        .kind = AckBundles::Action::Kind::UPVOTE,
+        .upvoted = target.m6id,
+        .downvoted = Downvoted(pending, &target.m6id),
+    };
+}
+
+//! Resolve a vote array: one element per active slot, in ascending slot order.
+bool ResolveVotes(const std::vector<uint16_t>& votes, const DrivechainState& state, AckBundles& out, BlockError& error)
+{
+    const std::vector<SlotNum> active{state.ActiveSlots()};
+    // Spec divergence: BIP-300 invalidates a block whose vote array is longer
+    // than the active-slot vector. The reference implementation requires the
+    // two to be equal, so a short array is rejected too.
+    if (votes.size() != active.size()) {
+        error = BlockError::M4_VOTE_COUNT_MISMATCH;
+        return false;
+    }
+
+    for (size_t i{0}; i < votes.size(); ++i) {
+        const SlotNum slot{active[i]};
+        const uint16_t vote{votes[i]};
+        if (vote == M4AckBundles::ABSTAIN_TWO_BYTES) continue;
+
+        const PendingWithdrawals* pending{state.GetPendingWithdrawals(slot)};
+        if (pending == nullptr) {
+            error = BlockError::STATE_MISMATCH;
+            return false;
+        }
+
+        if (vote == M4AckBundles::ALARM_TWO_BYTES) {
+            std::vector<Txid> downvoted{Downvoted(*pending, nullptr)};
+            // An alarm over a slot where nothing can lose a vote does nothing.
+            if (downvoted.empty()) continue;
+            out.actions[slot] = AckBundles::Action{
+                .kind = AckBundles::Action::Kind::ALARM,
+                .downvoted = std::move(downvoted),
+            };
+            continue;
+        }
+
+        if (vote >= pending->size()) {
+            error = BlockError::M4_BUNDLE_INDEX_OUT_OF_RANGE;
+            return false;
+        }
+        if (const auto action{Upvote(*pending, (*pending)[vote])}) {
+            out.actions[slot] = *action;
+        }
+    }
+    return true;
+}
+
+//! Per slot, upvote a bundle leading every rival by at least the margin.
+void ResolveLeadingBy50(const DrivechainState& state, AckBundles& out)
+{
+    for (const SlotNum slot : state.ActiveSlots()) {
+        const PendingWithdrawals* pending{state.GetPendingWithdrawals(slot)};
+        if (pending == nullptr || pending->empty()) continue;
+
+        const PendingWithdrawal* leader{&pending->front()};
+        uint16_t runner_up{0};
+        for (const PendingWithdrawal& bundle : *pending) {
+            if (bundle.vote_count > leader->vote_count) {
+                runner_up = leader->vote_count;
+                leader = &bundle;
+            } else if (&bundle != leader && bundle.vote_count > runner_up) {
+                runner_up = bundle.vote_count;
+            }
+        }
+        // A sole bundle leads an implicit zero-vote rival. A tie for the lead
+        // leaves a margin of zero, so ties never upvote and the result does not
+        // depend on which of the tied bundles is called the leader.
+        if (leader->vote_count - runner_up < LEADING_BY_50_MARGIN) continue;
+        if (const auto action{Upvote(*pending, *leader)}) {
+            out.actions[slot] = *action;
+        }
+    }
+}
+
+//! Replay the previous block's resolved votes against the current state.
+void ResolveRepeatPrevious(const AckBundles& previous, const DrivechainState& state, AckBundles& out)
+{
+    for (const auto& [slot, action] : previous.actions) {
+        const PendingWithdrawals* pending{state.GetPendingWithdrawals(slot)};
+        if (pending == nullptr) continue;
+
+        if (action.kind == AckBundles::Action::Kind::ALARM) {
+            // An alarm applies to whatever is pending now, so the set of
+            // bundles that lose a vote is recomputed rather than replayed.
+            std::vector<Txid> downvoted{Downvoted(*pending, nullptr)};
+            if (downvoted.empty()) continue;
+            out.actions[slot] = AckBundles::Action{
+                .kind = AckBundles::Action::Kind::ALARM,
+                .downvoted = std::move(downvoted),
+            };
+            continue;
+        }
+
+        // A repeated upvote naming a bundle that is no longer pending casts no
+        // vote in that slot, and must not invalidate the block.
+        const auto target{std::find_if(pending->begin(), pending->end(),
+                                       [&action](const PendingWithdrawal& bundle) {
+                                           return bundle.m6id == action.upvoted;
+                                       })};
+        if (target == pending->end()) continue;
+        if (const auto repeated{Upvote(*pending, *target)}) {
+            out.actions[slot] = *repeated;
+        }
+    }
+}
+} // namespace
 
 std::string BlockErrorString(BlockError error)
 {
@@ -29,6 +166,9 @@ std::string BlockErrorString(BlockError error)
     case BlockError::DUPLICATE_M7: return "bad-drivechain-duplicate-m7";
     case BlockError::M3_INACTIVE_SIDECHAIN: return "bad-drivechain-m3-inactive-sidechain";
     case BlockError::M3_BUNDLE_ALREADY_PENDING: return "bad-drivechain-m3-bundle-already-pending";
+    case BlockError::M4_TWO_BYTES_WITHIN_BYTE_RANGE: return "bad-drivechain-m4-two-bytes-unnecessary";
+    case BlockError::M4_VOTE_COUNT_MISMATCH: return "bad-drivechain-m4-vote-count";
+    case BlockError::M4_BUNDLE_INDEX_OUT_OF_RANGE: return "bad-drivechain-m4-bundle-index";
     case BlockError::STATE_MISMATCH: return "drivechain-state-mismatch";
     }
     return "bad-drivechain-unknown";
@@ -192,6 +332,41 @@ bool HandleM3(const M3ProposeBundle& m3, const DrivechainState& state, ProposeBu
 
     out = ProposeBundle{.slot = m3.slot, .m6id = m3.m6id};
     return true;
+}
+
+bool HandleM4(const M4AckBundles& m4,
+              const DrivechainState& state,
+              const AckBundles& previous,
+              AckBundles& out,
+              BlockError& error)
+{
+    out = AckBundles{};
+
+    switch (m4.version) {
+    case M4AckBundles::Version::REPEAT_PREVIOUS:
+        // Replays the votes the previous block resolved to, which chains
+        // transitively. Repeating an UPVOTE_LEADING_BY_50 therefore replays
+        // what it decided rather than re-deciding it against current counts.
+        ResolveRepeatPrevious(previous, state, out);
+        return true;
+    case M4AckBundles::Version::UPVOTE_LEADING_BY_50:
+        ResolveLeadingBy50(state, out);
+        return true;
+    case M4AckBundles::Version::VOTES_ONE_BYTE:
+        return ResolveVotes(m4.NormalizedUpvotes(), state, out, error);
+    case M4AckBundles::Version::VOTES_TWO_BYTE:
+        // BIP-300 rejects the two-byte encoding where one byte would have
+        // sufficed. Decidable only from the raw values, which is why the
+        // message keeps them unnormalized.
+        if (std::ranges::all_of(m4.upvotes, [](uint16_t vote) { return vote <= 253; })) {
+            error = BlockError::M4_TWO_BYTES_WITHIN_BYTE_RANGE;
+            return false;
+        }
+        return ResolveVotes(m4.NormalizedUpvotes(), state, out, error);
+    }
+
+    error = BlockError::STATE_MISMATCH;
+    return false;
 }
 
 } // namespace drivechain

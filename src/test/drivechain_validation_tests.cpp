@@ -15,6 +15,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <cstring>
+#include <limits>
 #include <set>
 #include <span>
 #include <string>
@@ -81,6 +82,52 @@ M1ProposeSidechain M1(SlotNum slot, const char* description)
         .slot = slot,
         .description = std::vector<unsigned char>{description, description + strlen(description)},
     };
+}
+
+//! Activate `slot` and give it bundles with the listed vote counts.
+void ActivateWith(DrivechainState& state, SlotNum slot, const std::vector<uint16_t>& votes)
+{
+    Sidechain sidechain{MakeProposal(slot, "alpha", 0)};
+    sidechain.activation_height = 0;
+    state.ActivateSidechain(sidechain);
+    for (size_t i{0}; i < votes.size(); ++i) {
+        state.ModifyPendingWithdrawals(slot)->push_back(PendingWithdrawal{
+            .m6id = Txid::FromUint256(uint256{static_cast<uint8_t>(slot * 16 + i + 1)}),
+            .vote_count = votes[i],
+            .proposal_height = 0,
+        });
+    }
+}
+
+Txid BundleAt(const DrivechainState& state, SlotNum slot, size_t index)
+{
+    return state.GetPendingWithdrawals(slot)->at(index).m6id;
+}
+
+M4AckBundles OneByte(const std::vector<uint16_t>& votes)
+{
+    return M4AckBundles{.version = M4AckBundles::Version::VOTES_ONE_BYTE, .upvotes = votes};
+}
+
+M4AckBundles TwoByte(const std::vector<uint16_t>& votes)
+{
+    return M4AckBundles{.version = M4AckBundles::Version::VOTES_TWO_BYTE, .upvotes = votes};
+}
+
+AckBundles ResolveM4(const M4AckBundles& m4, const DrivechainState& state, const AckBundles& previous = {})
+{
+    AckBundles out;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_REQUIRE(HandleM4(m4, state, previous, out, error));
+    return out;
+}
+
+BlockError RejectM4(const M4AckBundles& m4, const DrivechainState& state)
+{
+    AckBundles out;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_REQUIRE(!HandleM4(m4, state, AckBundles{}, out, error));
+    return error;
 }
 
 M2AckSidechain M2(const Sidechain& proposal)
@@ -205,7 +252,9 @@ BOOST_AUTO_TEST_CASE(error_strings_are_distinct)
     const std::vector<BlockError> errors{
         BlockError::DUPLICATE_M1, BlockError::DUPLICATE_M2, BlockError::DUPLICATE_M4,
         BlockError::DUPLICATE_M7, BlockError::M3_INACTIVE_SIDECHAIN,
-        BlockError::M3_BUNDLE_ALREADY_PENDING, BlockError::STATE_MISMATCH,
+        BlockError::M3_BUNDLE_ALREADY_PENDING, BlockError::M4_TWO_BYTES_WITHIN_BYTE_RANGE,
+        BlockError::M4_VOTE_COUNT_MISMATCH, BlockError::M4_BUNDLE_INDEX_OUT_OF_RANGE,
+        BlockError::STATE_MISMATCH,
     };
     std::set<std::string> seen;
     for (const BlockError error : errors) {
@@ -527,6 +576,233 @@ BOOST_AUTO_TEST_CASE(a_proposed_bundle_starts_with_one_ack)
     // Being proposed counts as the bundle's first upvote.
     BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(1)->at(0).vote_count, 1);
     BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(1)->at(0).proposal_height, 500);
+
+    UndoError undo_error{};
+    BOOST_REQUIRE(block.Undo(state, undo_error));
+    BOOST_CHECK(state == before);
+}
+
+BOOST_AUTO_TEST_CASE(m4_needs_one_vote_per_active_slot)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {5});
+    ActivateWith(state, 2, {5});
+
+    // Spec divergence: BIP-300 rejects only an array longer than the
+    // active-slot vector. The reference implementation requires equality, so a
+    // short array is rejected too, and this follows it.
+    BOOST_CHECK(RejectM4(OneByte({0}), state) == BlockError::M4_VOTE_COUNT_MISMATCH);
+    BOOST_CHECK(RejectM4(OneByte({0, 0, 0}), state) == BlockError::M4_VOTE_COUNT_MISMATCH);
+    BOOST_CHECK_EQUAL(ResolveM4(OneByte({0, 0}), state).actions.size(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(m4_votes_index_active_slots_in_order)
+{
+    // Active slots may be sparse, so array positions are not slot numbers:
+    // A[i] is the vote for the i'th slot in ascending order.
+    DrivechainState state;
+    ActivateWith(state, 200, {5});
+    ActivateWith(state, 3, {5});
+    ActivateWith(state, 17, {5});
+
+    // Upvote in the first and third slots, abstain in the second.
+    const AckBundles resolved{ResolveM4(OneByte({0, M4AckBundles::ABSTAIN_ONE_BYTE, 0}), state)};
+    BOOST_CHECK_EQUAL(resolved.actions.count(3), 1U);
+    BOOST_CHECK_EQUAL(resolved.actions.count(17), 0U);
+    BOOST_CHECK_EQUAL(resolved.actions.count(200), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(m4_upvote_downvotes_only_what_can_move)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {5, 3, 0});
+
+    const AckBundles resolved{ResolveM4(OneByte({0}), state)};
+    BOOST_REQUIRE_EQUAL(resolved.actions.count(1), 1U);
+    const AckBundles::Action& action{resolved.actions.at(1)};
+    BOOST_CHECK(action.kind == AckBundles::Action::Kind::UPVOTE);
+    BOOST_CHECK(action.upvoted == BundleAt(state, 1, 0));
+
+    // The bundle already at zero cannot lose a vote, so it is not recorded --
+    // undo would otherwise hand it one it never lost.
+    BOOST_REQUIRE_EQUAL(action.downvoted.size(), 1U);
+    BOOST_CHECK(action.downvoted[0] == BundleAt(state, 1, 1));
+}
+
+BOOST_AUTO_TEST_CASE(m4_alarm_and_abstain)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {5, 0});
+
+    // Abstain changes nothing, so it produces no action at all.
+    BOOST_CHECK(ResolveM4(OneByte({M4AckBundles::ABSTAIN_ONE_BYTE}), state).actions.empty());
+
+    const AckBundles alarmed{ResolveM4(OneByte({M4AckBundles::ALARM_ONE_BYTE}), state)};
+    BOOST_REQUIRE_EQUAL(alarmed.actions.count(1), 1U);
+    BOOST_CHECK(alarmed.actions.at(1).kind == AckBundles::Action::Kind::ALARM);
+    BOOST_CHECK_EQUAL(alarmed.actions.at(1).downvoted.size(), 1U);
+
+    // An alarm over a slot where nothing can lose a vote does nothing.
+    DrivechainState all_zero;
+    ActivateWith(all_zero, 1, {0, 0});
+    BOOST_CHECK(ResolveM4(OneByte({M4AckBundles::ALARM_ONE_BYTE}), all_zero).actions.empty());
+}
+
+BOOST_AUTO_TEST_CASE(m4_bundle_index_must_exist)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {5, 3});
+
+    BOOST_CHECK_EQUAL(ResolveM4(OneByte({1}), state).actions.size(), 1U);
+    BOOST_CHECK(RejectM4(OneByte({2}), state) == BlockError::M4_BUNDLE_INDEX_OUT_OF_RANGE);
+
+    // A slot with no bundles at all can only be abstained or alarmed on.
+    DrivechainState empty;
+    ActivateWith(empty, 1, {});
+    BOOST_CHECK(RejectM4(OneByte({0}), empty) == BlockError::M4_BUNDLE_INDEX_OUT_OF_RANGE);
+    BOOST_CHECK(ResolveM4(OneByte({M4AckBundles::ABSTAIN_ONE_BYTE}), empty).actions.empty());
+}
+
+BOOST_AUTO_TEST_CASE(m4_two_byte_encoding_must_be_necessary)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {5});
+
+    // Every value fits in a byte, so the two-byte encoding wastes one per
+    // element and the block is rejected.
+    BOOST_CHECK(RejectM4(TwoByte({253}), state) == BlockError::M4_TWO_BYTES_WITHIN_BYTE_RANGE);
+    // 254 and 255 are the one-byte sentinels, so a real index above 253 is the
+    // first value that genuinely needs two bytes.
+    BOOST_CHECK(RejectM4(TwoByte({0}), state) == BlockError::M4_TWO_BYTES_WITHIN_BYTE_RANGE);
+    BOOST_CHECK(ResolveM4(TwoByte({M4AckBundles::ABSTAIN_TWO_BYTES}), state).actions.empty());
+}
+
+BOOST_AUTO_TEST_CASE(m4_one_byte_sentinels_are_not_indices)
+{
+    // 0xFE and 0xFF in the one-byte encoding are alarm and abstain, not
+    // bundle positions 254 and 255.
+    DrivechainState state;
+    ActivateWith(state, 1, {5});
+    BOOST_CHECK(ResolveM4(OneByte({M4AckBundles::ALARM_ONE_BYTE}), state).actions.at(1).kind ==
+                AckBundles::Action::Kind::ALARM);
+    BOOST_CHECK(ResolveM4(OneByte({M4AckBundles::ABSTAIN_ONE_BYTE}), state).actions.empty());
+}
+
+BOOST_AUTO_TEST_CASE(m4_leading_by_fifty)
+{
+    const M4AckBundles leading{.version = M4AckBundles::Version::UPVOTE_LEADING_BY_50, .upvotes = {}};
+
+    // A lead of exactly 49 is not enough; 50 is.
+    DrivechainState narrow;
+    ActivateWith(narrow, 1, {49, 0});
+    BOOST_CHECK(ResolveM4(leading, narrow).actions.empty());
+
+    DrivechainState wide;
+    ActivateWith(wide, 1, {50, 0});
+    BOOST_REQUIRE_EQUAL(ResolveM4(leading, wide).actions.count(1), 1U);
+    BOOST_CHECK(ResolveM4(leading, wide).actions.at(1).upvoted == BundleAt(wide, 1, 0));
+
+    // A sole bundle leads an implicit zero-vote rival.
+    DrivechainState alone;
+    ActivateWith(alone, 1, {50});
+    BOOST_CHECK_EQUAL(ResolveM4(leading, alone).actions.count(1), 1U);
+
+    // A tie for the lead leaves a margin of zero, so nothing is upvoted and
+    // the outcome does not depend on which of the tied bundles is picked.
+    DrivechainState tied;
+    ActivateWith(tied, 1, {100, 100});
+    BOOST_CHECK(ResolveM4(leading, tied).actions.empty());
+
+    // The margin is against the closest rival, not the weakest.
+    DrivechainState spread;
+    ActivateWith(spread, 1, {100, 60, 0});
+    BOOST_CHECK(ResolveM4(leading, spread).actions.empty());
+}
+
+BOOST_AUTO_TEST_CASE(m4_repeat_previous_replays_resolved_votes)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {5, 3});
+
+    AckBundles previous;
+    previous.actions[1] = AckBundles::Action{
+        .kind = AckBundles::Action::Kind::UPVOTE,
+        .upvoted = BundleAt(state, 1, 0),
+        .downvoted = {BundleAt(state, 1, 1)},
+    };
+
+    const M4AckBundles repeat{.version = M4AckBundles::Version::REPEAT_PREVIOUS, .upvotes = {}};
+    const AckBundles resolved{ResolveM4(repeat, state, previous)};
+    BOOST_REQUIRE_EQUAL(resolved.actions.count(1), 1U);
+    BOOST_CHECK(resolved.actions.at(1).upvoted == BundleAt(state, 1, 0));
+
+    // With no previous M4, a repeat casts no votes rather than failing.
+    BOOST_CHECK(ResolveM4(repeat, state, AckBundles{}).actions.empty());
+}
+
+BOOST_AUTO_TEST_CASE(m4_repeat_previous_tolerates_a_vanished_bundle)
+{
+    // The bundle the previous block upvoted has since been paid out or aged
+    // away. That casts no vote in the slot, and must not invalidate the block.
+    DrivechainState state;
+    ActivateWith(state, 1, {5});
+
+    AckBundles previous;
+    previous.actions[1] = AckBundles::Action{
+        .kind = AckBundles::Action::Kind::UPVOTE,
+        .upvoted = Txid::FromUint256(uint256{250}),
+    };
+
+    const M4AckBundles repeat{.version = M4AckBundles::Version::REPEAT_PREVIOUS, .upvotes = {}};
+    BOOST_CHECK(ResolveM4(repeat, state, previous).actions.empty());
+}
+
+BOOST_AUTO_TEST_CASE(m4_repeat_previous_recomputes_an_alarm)
+{
+    // An alarm applies to whatever is pending now, so the set of bundles that
+    // lose a vote is recomputed rather than replayed: replaying a stale set
+    // would restore votes on undo that were never taken.
+    DrivechainState state;
+    ActivateWith(state, 1, {5, 4});
+
+    AckBundles previous;
+    previous.actions[1] = AckBundles::Action{
+        .kind = AckBundles::Action::Kind::ALARM,
+        .downvoted = {Txid::FromUint256(uint256{250})},
+    };
+
+    const M4AckBundles repeat{.version = M4AckBundles::Version::REPEAT_PREVIOUS, .upvotes = {}};
+    const AckBundles resolved{ResolveM4(repeat, state, previous)};
+    BOOST_REQUIRE_EQUAL(resolved.actions.count(1), 1U);
+    BOOST_CHECK_EQUAL(resolved.actions.at(1).downvoted.size(), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(m4_a_saturated_bundle_casts_no_vote)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {0});
+    state.ModifyPendingWithdrawals(1)->at(0).vote_count = std::numeric_limits<uint16_t>::max();
+
+    // No action rather than an overflow, and the block stays valid.
+    BOOST_CHECK(ResolveM4(OneByte({0}), state).actions.empty());
+}
+
+BOOST_AUTO_TEST_CASE(m4_votes_round_trip_through_the_diff)
+{
+    DrivechainState state;
+    ActivateWith(state, 1, {5, 3, 0});
+    ActivateWith(state, 2, {7});
+
+    BlockDiff block;
+    block.coinbase.msgs.push_back(ResolveM4(OneByte({0, M4AckBundles::ALARM_ONE_BYTE}), state));
+
+    const DrivechainState before{state};
+    BOOST_REQUIRE(block.Apply(state, 500));
+
+    BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(1)->at(0).vote_count, 6);
+    BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(1)->at(1).vote_count, 2);
+    BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(1)->at(2).vote_count, 0);
+    BOOST_CHECK_EQUAL(state.GetPendingWithdrawals(2)->at(0).vote_count, 6);
 
     UndoError undo_error{};
     BOOST_REQUIRE(block.Undo(state, undo_error));

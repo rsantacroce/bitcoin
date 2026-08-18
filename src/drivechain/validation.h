@@ -44,6 +44,12 @@ enum class BlockError {
     //! An M3 proposing a bundle that is already pending. Allowing it would
     //! reset the bundle's ack count and its clock.
     M3_BUNDLE_ALREADY_PENDING,
+    //! An M4 using the two-byte encoding where one byte would have done.
+    M4_TWO_BYTES_WITHIN_BYTE_RANGE,
+    //! An M4 whose vote array does not have one element per active slot.
+    M4_VOTE_COUNT_MISMATCH,
+    //! An M4 selecting a bundle position that does not exist in that slot.
+    M4_BUNDLE_INDEX_OUT_OF_RANGE,
     //! The state does not contain what a diff built against it expects. A bug
     //! or corruption, not a bad block.
     STATE_MISMATCH,
@@ -156,6 +162,35 @@ FailedBundles CollectFailedBundles(const DrivechainState& state, const Threshold
  * BIP-300, "M3 — Propose Bundle".
  */
 [[nodiscard]] bool HandleM3(const M3ProposeBundle& m3, const DrivechainState& state, ProposeBundle& out, BlockError& error);
+
+//! The margin a bundle must lead every rival by for UPVOTE_LEADING_BY_50.
+static constexpr uint16_t LEADING_BY_50_MARGIN{50};
+
+/**
+ * Handle an M4: cast this block's withdrawal votes.
+ *
+ * Votes are positional twice over. `A[i]` is the vote for the i'th active slot
+ * in ascending slot order -- active slots may be sparse, so array positions are
+ * not slot numbers -- and within a slot the vote selects a bundle by its
+ * position in that slot's list.
+ *
+ * Three ways to make the block invalid: an array that does not have exactly one
+ * element per active slot, a vote selecting a bundle position that does not
+ * exist, and the two-byte encoding where no element needed it. All three are
+ * raised as open questions by the LayerTwo-Labs draft, and all three are kept
+ * as the reference implementation enforces them.
+ *
+ * `previous` is the previous block's resolved votes, which REPEAT_PREVIOUS
+ * replays. Pass an empty value when the previous block had no M4, or none that
+ * resolved to anything; repeats then cast no votes.
+ *
+ * BIP-300, "M4 — ACK Bundle(s)".
+ */
+[[nodiscard]] bool HandleM4(const M4AckBundles& m4,
+                            const DrivechainState& state,
+                            const AckBundles& previous,
+                            AckBundles& out,
+                            BlockError& error);
 
 } // namespace drivechain
 
