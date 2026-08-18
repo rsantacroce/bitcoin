@@ -181,6 +181,9 @@ std::string BlockErrorString(BlockError error)
     case BlockError::M6_TREASURY_OUTPUT_COUNT: return "bad-drivechain-m6-treasury-output-count";
     case BlockError::M6_UNKNOWN_BUNDLE: return "bad-drivechain-m6-unknown-bundle";
     case BlockError::M6_INSUFFICIENT_VOTES: return "bad-drivechain-m6-insufficient-votes";
+    case BlockError::BMM_REQUEST_NOT_ACCEPTED: return "bad-drivechain-bmm-request-not-accepted";
+    case BlockError::BMM_REQUEST_EXPIRED: return "bad-drivechain-bmm-request-expired";
+    case BlockError::MULTIPLE_BMM_REQUESTS: return "bad-drivechain-multiple-bmm-requests";
     case BlockError::STATE_MISMATCH: return "drivechain-state-mismatch";
     }
     return "bad-drivechain-unknown";
@@ -198,7 +201,6 @@ bool CollectCoinbaseMessages(const CTransaction& coinbase, CoinbaseMessages& out
     // M4 at all. An M7 is a duplicate of any other M7 for the same slot.
     std::set<SidechainProposalId> proposed;
     std::set<SlotNum> acked_slots;
-    std::set<SlotNum> accepted_slots;
 
     for (uint32_t vout{0}; vout < coinbase.vout.size(); ++vout) {
         const std::optional<CoinbaseMessage> message{ParseCoinbaseMessage(coinbase.vout[vout].scriptPubKey)};
@@ -223,7 +225,7 @@ bool CollectCoinbaseMessages(const CTransaction& coinbase, CoinbaseMessages& out
             }
             out.has_m4 = true;
         } else if (const auto* m7{std::get_if<M7BmmAccept>(&*message)}) {
-            if (!accepted_slots.insert(m7->slot).second) {
+            if (!out.bmm_accepts.emplace(m7->slot, m7->sidechain_block_hash).second) {
                 error = BlockError::DUPLICATE_M7;
                 return false;
             }
@@ -544,6 +546,40 @@ bool HandleTreasuryTx(const CTransaction& tx,
     } else if (!deposits.ctips.empty()) {
         out = deposits;
     }
+    return true;
+}
+
+bool HandleM8(const CTransaction& tx,
+              const std::map<SlotNum, uint256>* accepted,
+              const uint256& parent_hash,
+              std::optional<SlotNum>& slot,
+              BlockError& error)
+{
+    slot.reset();
+
+    const std::optional<M8BmmRequest> request{ParseM8Request(tx)};
+    if (!request) return true;
+
+    if (accepted != nullptr) {
+        // A miner can only collect on a request she accepted. Without this
+        // rule she could take the payment and mine someone else's side:block,
+        // or none at all.
+        const auto it{accepted->find(request->slot)};
+        if (it == accepted->end() || it->second != request->sidechain_block_hash) {
+            error = BlockError::BMM_REQUEST_NOT_ACCEPTED;
+            return false;
+        }
+    }
+
+    // A request is written for one parent and expires with it. Without this a
+    // miner could hoard old requests and mine them later, collecting payment
+    // for side:blocks that can no longer be connected.
+    if (request->prev_main_block_hash != parent_hash) {
+        error = BlockError::BMM_REQUEST_EXPIRED;
+        return false;
+    }
+
+    slot = request->slot;
     return true;
 }
 

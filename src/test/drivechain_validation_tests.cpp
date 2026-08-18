@@ -18,6 +18,9 @@
 
 #include <cstring>
 #include <limits>
+#include <map>
+#include <optional>
+#include <utility>
 #include <set>
 #include <span>
 #include <string>
@@ -164,6 +167,23 @@ BlockError RejectTx(const CMutableTransaction& tx, const DrivechainState& state)
     return error;
 }
 
+//! A transaction carrying an M8 request at output 0.
+CMutableTransaction M8Tx(SlotNum slot, const uint256& sidechain_block_hash, const uint256& parent)
+{
+    std::vector<unsigned char> bytes{OP_RETURN, M8_SCRIPT_SIZE - 2};
+    bytes.insert(bytes.end(), M8BmmRequest::TAG.begin(), M8BmmRequest::TAG.end());
+    bytes.push_back(slot);
+    bytes.insert(bytes.end(), sidechain_block_hash.begin(), sidechain_block_hash.end());
+    bytes.insert(bytes.end(), parent.begin(), parent.end());
+
+    CMutableTransaction tx;
+    tx.vin.emplace_back(COutPoint{Txid::FromUint256(uint256{1}), 0});
+    tx.vout.emplace_back(0, CScript(bytes.begin(), bytes.end()));
+    // How the miner is paid is outside consensus; this stands in for it.
+    tx.vout.emplace_back(1000, CScript() << OP_TRUE);
+    return tx;
+}
+
 M2AckSidechain M2(const Sidechain& proposal)
 {
     return M2AckSidechain{.slot = proposal.slot, .proposal_id = proposal.Id().description_hash};
@@ -293,7 +313,9 @@ BOOST_AUTO_TEST_CASE(error_strings_are_distinct)
         BlockError::TREASURY_SPENT_WITHOUT_NEW_CTIP, BlockError::ZERO_VALUE_CHANGE,
         BlockError::M6_INPUT_COUNT, BlockError::M6_TREASURY_OUTPUT_INDEX,
         BlockError::M6_TREASURY_OUTPUT_COUNT, BlockError::M6_UNKNOWN_BUNDLE,
-        BlockError::M6_INSUFFICIENT_VOTES, BlockError::STATE_MISMATCH,
+        BlockError::M6_INSUFFICIENT_VOTES, BlockError::BMM_REQUEST_NOT_ACCEPTED,
+        BlockError::BMM_REQUEST_EXPIRED, BlockError::MULTIPLE_BMM_REQUESTS,
+        BlockError::STATE_MISMATCH,
     };
     std::set<std::string> seen;
     for (const BlockError error : errors) {
@@ -1101,6 +1123,90 @@ BOOST_AUTO_TEST_CASE(treasury_movement_round_trips_through_the_diff)
     UndoError undo_error{};
     BOOST_REQUIRE(block.Undo(state, undo_error));
     BOOST_CHECK(state == before);
+}
+
+BOOST_AUTO_TEST_CASE(m7_accepts_are_collected_per_slot)
+{
+    const CoinbaseMessages messages{CollectOk({
+        SlotAndHashScript(M7BmmAccept::TAG, 1, 11),
+        SlotAndHashScript(M7BmmAccept::TAG, 2, 22),
+    })};
+    BOOST_REQUIRE_EQUAL(messages.bmm_accepts.size(), 2U);
+    BOOST_CHECK(messages.bmm_accepts.at(1) == uint256{11});
+    BOOST_CHECK(messages.bmm_accepts.at(2) == uint256{22});
+}
+
+BOOST_AUTO_TEST_CASE(a_request_needs_a_matching_accept)
+{
+    const uint256 parent{uint256{77}};
+    const uint256 hash{uint256{11}};
+    std::map<SlotNum, uint256> accepted{{1, hash}};
+
+    std::optional<SlotNum> slot;
+    BlockError error{BlockError::STATE_MISMATCH};
+
+    BOOST_CHECK(HandleM8(CTransaction{M8Tx(1, hash, parent)}, &accepted, parent, slot, error));
+    BOOST_REQUIRE(slot.has_value());
+    BOOST_CHECK_EQUAL(int{*slot}, 1);
+
+    // Right slot, wrong side:block: the miner would be paid for a block she is
+    // not going to let anyone connect.
+    BOOST_CHECK(!HandleM8(CTransaction{M8Tx(1, uint256{99}, parent)}, &accepted, parent, slot, error));
+    BOOST_CHECK(error == BlockError::BMM_REQUEST_NOT_ACCEPTED);
+
+    // A slot with no accept at all.
+    BOOST_CHECK(!HandleM8(CTransaction{M8Tx(2, hash, parent)}, &accepted, parent, slot, error));
+    BOOST_CHECK(error == BlockError::BMM_REQUEST_NOT_ACCEPTED);
+}
+
+BOOST_AUTO_TEST_CASE(a_request_binds_to_one_parent)
+{
+    // Without this a miner could hoard old requests and mine them later,
+    // collecting payment for side:blocks that can no longer be connected.
+    const uint256 hash{uint256{11}};
+    std::map<SlotNum, uint256> accepted{{1, hash}};
+
+    std::optional<SlotNum> slot;
+    BlockError error{BlockError::STATE_MISMATCH};
+    BOOST_CHECK(!HandleM8(CTransaction{M8Tx(1, hash, uint256{5})}, &accepted, uint256{77}, slot, error));
+    BOOST_CHECK(error == BlockError::BMM_REQUEST_EXPIRED);
+}
+
+BOOST_AUTO_TEST_CASE(without_a_coinbase_only_expiry_can_be_judged)
+{
+    // Judging a transaction for the mempool: the M7 that would accept it does
+    // not exist yet, so the acceptance rule cannot be applied and only the
+    // expiry rule can.
+    const uint256 parent{uint256{77}};
+    std::optional<SlotNum> slot;
+    BlockError error{BlockError::STATE_MISMATCH};
+
+    BOOST_CHECK(HandleM8(CTransaction{M8Tx(1, uint256{11}, parent)}, nullptr, parent, slot, error));
+    BOOST_CHECK(slot.has_value());
+
+    BOOST_CHECK(!HandleM8(CTransaction{M8Tx(1, uint256{11}, uint256{5})}, nullptr, parent, slot, error));
+    BOOST_CHECK(error == BlockError::BMM_REQUEST_EXPIRED);
+}
+
+BOOST_AUTO_TEST_CASE(a_transaction_that_is_not_a_request_is_left_alone)
+{
+    const uint256 parent{uint256{77}};
+    std::map<SlotNum, uint256> accepted;
+    std::optional<SlotNum> slot;
+    BlockError error{BlockError::STATE_MISMATCH};
+
+    CMutableTransaction ordinary;
+    ordinary.vin.emplace_back(SomeOutPoint(1));
+    ordinary.vout.emplace_back(1000, CScript() << OP_TRUE);
+    BOOST_CHECK(HandleM8(CTransaction{ordinary}, &accepted, parent, slot, error));
+    BOOST_CHECK(!slot.has_value());
+
+    // A request that is not at output 0 is not a request. BIP-301 examines
+    // that output and nothing else.
+    CMutableTransaction shifted{M8Tx(1, uint256{11}, parent)};
+    std::swap(shifted.vout[0], shifted.vout[1]);
+    BOOST_CHECK(HandleM8(CTransaction{shifted}, &accepted, parent, slot, error));
+    BOOST_CHECK(!slot.has_value());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

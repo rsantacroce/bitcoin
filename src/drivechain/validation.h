@@ -10,8 +10,10 @@
 #include <drivechain/params.h>
 #include <drivechain/state.h>
 #include <primitives/transaction.h>
+#include <uint256.h>
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -72,6 +74,12 @@ enum class BlockError {
     M6_UNKNOWN_BUNDLE,
     //! A withdrawal whose bundle has not been approved by enough votes.
     M6_INSUFFICIENT_VOTES,
+    //! An M8 with no matching M7 in the same block's coinbase.
+    BMM_REQUEST_NOT_ACCEPTED,
+    //! An M8 written for a different parent block.
+    BMM_REQUEST_EXPIRED,
+    //! More than one valid M8 for the same slot in one block.
+    MULTIPLE_BMM_REQUESTS,
     //! The state does not contain what a diff built against it expects. A bug
     //! or corruption, not a bad block.
     STATE_MISMATCH,
@@ -94,6 +102,9 @@ struct CoinbaseMessages {
     //! Each message with the index of the output that carried it. The index is
     //! what breaks ties in the canonical order of pending bundles.
     std::vector<std::pair<CoinbaseMessage, uint32_t>> messages;
+
+    //! The side:block hash each slot's M7 endorsed, at most one per slot.
+    std::map<SlotNum, uint256> bmm_accepts;
 
     //! Whether an M4 was present. Its absence is not the same as an M4 that
     //! abstains everywhere: a block with no M4 abstains for every slot, which
@@ -235,6 +246,26 @@ static constexpr uint16_t LEADING_BY_50_MARGIN{50};
                                     const Thresholds& thresholds,
                                     std::optional<TxDiff>& out,
                                     BlockError& error);
+
+/**
+ * Handle a transaction that may be an M8 blind-merged-mining request.
+ *
+ * `slot` is set when the transaction is a valid request, and left empty when it
+ * is not a request at all -- which is almost every transaction. A request that
+ * is a request but not a valid one makes the block invalid.
+ *
+ * `accepted` is the set of side:block hashes this block's coinbase endorsed.
+ * Pass nullptr when there is no coinbase to check against, as when judging a
+ * transaction for the mempool: only the expiry rule can be decided then, since
+ * the M7 that would accept the request does not exist yet.
+ *
+ * BIP-301, "M8 — BMM Request", Validation.
+ */
+[[nodiscard]] bool HandleM8(const CTransaction& tx,
+                            const std::map<SlotNum, uint256>* accepted,
+                            const uint256& parent_hash,
+                            std::optional<SlotNum>& slot,
+                            BlockError& error);
 
 } // namespace drivechain
 
