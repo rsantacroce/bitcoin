@@ -253,6 +253,7 @@ add_library(bitcoin_node STATIC EXCLUDE_FROM_ALL
   private_broadcast.cpp
   rest.cpp
   rpc/blockchain.cpp
+  rpc/drivechain.cpp
   rpc/external_signer.cpp
   rpc/fees.cpp
   rpc/mempool.cpp
