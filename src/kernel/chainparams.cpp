@@ -581,7 +581,7 @@ public:
         consensus.CSVHeight = 1;    // Always active unless overridden
         consensus.SegwitHeight = 0; // Always active unless overridden
         consensus.MinBIP9WarningHeight = 0;
-        consensus.drivechain_activation_height = 0; // Always active
+        consensus.drivechain_activation_height = drivechain::NOT_DEPLOYED; // Set with -testactivationheight
         consensus.drivechain_thresholds = drivechain::SHORT_THRESHOLDS;
         consensus.powLimit = uint256{"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"};
         consensus.nPowTargetTimespan = 24 * 60 * 60; // one day
@@ -620,6 +620,9 @@ public:
             switch (dep) {
             case Consensus::BuriedDeployment::DEPLOYMENT_SEGWIT:
                 consensus.SegwitHeight = int{height};
+                break;
+            case Consensus::BuriedDeployment::DEPLOYMENT_DRIVECHAIN:
+                consensus.drivechain_activation_height = int{height};
                 break;
             case Consensus::BuriedDeployment::DEPLOYMENT_HEIGHTINCB:
                 consensus.BIP34Height = int{height};

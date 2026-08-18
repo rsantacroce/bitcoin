@@ -3,6 +3,7 @@
 // file COPYING or https://www.opensource.org/licenses/mit-license.php.
 
 #include <chainparams.h>
+#include <consensus/params.h>
 #include <drivechain/params.h>
 #include <test/util/setup_common.h>
 
@@ -100,22 +101,29 @@ BOOST_AUTO_TEST_CASE(test_presets_keep_the_same_shape)
     }
 }
 
-BOOST_AUTO_TEST_CASE(only_regtest_activates_by_default)
+BOOST_AUTO_TEST_CASE(no_network_activates_by_default)
 {
-    // Choosing a mainnet activation is a deployment decision nobody has made:
-    // BIP-300 says it deploys "when/if a majority of hashrate runs the
-    // enforcer client", which is a signalling mechanism rather than a height.
-    // Until that is settled, the rules are off everywhere a real chain lives.
+    // Choosing an activation is a deployment decision nobody has made: BIP-300
+    // says it deploys "when/if a majority of hashrate runs the enforcer
+    // client", which is a signalling mechanism rather than a height. Until
+    // that is settled the rules are off everywhere, including regtest, where
+    // a test turns them on with -testactivationheight=drivechain@N.
     BOOST_CHECK_EQUAL(CChainParams::Main()->GetConsensus().drivechain_activation_height, drivechain::NOT_DEPLOYED);
     BOOST_CHECK_EQUAL(CChainParams::TestNet()->GetConsensus().drivechain_activation_height, drivechain::NOT_DEPLOYED);
     BOOST_CHECK_EQUAL(CChainParams::TestNet4()->GetConsensus().drivechain_activation_height, drivechain::NOT_DEPLOYED);
     BOOST_CHECK_EQUAL(CChainParams::SigNet({})->GetConsensus().drivechain_activation_height, drivechain::NOT_DEPLOYED);
+    BOOST_CHECK_EQUAL(CChainParams::RegTest({})->GetConsensus().drivechain_activation_height, drivechain::NOT_DEPLOYED);
 
-    // Regtest is where the functional tests live, so it is on from genesis
-    // with the short thresholds that make a whole cycle take seconds.
-    const auto regtest{CChainParams::RegTest({})};
-    BOOST_CHECK_EQUAL(regtest->GetConsensus().drivechain_activation_height, 0);
-    BOOST_CHECK(regtest->GetConsensus().drivechain_thresholds == SHORT_THRESHOLDS);
+    // Regtest still carries the short thresholds, so a test that turns the
+    // rules on gets a whole activation and withdrawal cycle in seconds.
+    BOOST_CHECK(CChainParams::RegTest({})->GetConsensus().drivechain_thresholds == SHORT_THRESHOLDS);
+}
+
+BOOST_AUTO_TEST_CASE(regtest_can_set_the_activation_height)
+{
+    CChainParams::RegTestOptions options;
+    options.activation_heights[Consensus::BuriedDeployment::DEPLOYMENT_DRIVECHAIN] = 42;
+    BOOST_CHECK_EQUAL(CChainParams::RegTest(options)->GetConsensus().drivechain_activation_height, 42);
 }
 
 BOOST_AUTO_TEST_CASE(mainnet_carries_the_specified_thresholds)
