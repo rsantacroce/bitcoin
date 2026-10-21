@@ -81,6 +81,7 @@ public:
         m_chain_type = ChainType::MAIN;
         consensus.EcashHeight = 973728; // Retarget boundary, 2016 * 483
         consensus.EcashForkBits = 0x1901a6e1; // Difficulty 2.6e9 at the fork block
+        consensus.DaaGuardrailHeight = consensus.EcashHeight; // The fork reset is the first move that can arm a guardrail
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nSubsidyHalvingInterval = 210000;
