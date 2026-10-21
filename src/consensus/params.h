@@ -88,6 +88,10 @@ struct Params {
     int EcashHeight{0};
     /** Compact target the block at EcashHeight must carry. */
     uint32_t EcashForkBits{0};
+    /** Height from which the DAA ricochet guardrails apply (see README-DAA.md).
+     *  Only difficulty moves made at or after this height can arm a guardrail.
+     *  Disabled by default. */
+    int DaaGuardrailHeight{std::numeric_limits<int>::max()};
     /**
      * Hashes of blocks that
      * - are known to be consensus valid, and

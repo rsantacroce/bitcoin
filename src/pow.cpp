@@ -47,11 +47,78 @@ unsigned int GetNextWorkRequired(const CBlockIndex* pindexLast, const CBlockHead
     return CalculateNextWorkRequired(pindexLast, pindexFirst->GetBlockTime(), params);
 }
 
-unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nFirstBlockTime, const Consensus::Params& params)
+namespace {
+// Difficulty is proportional to work, so the guardrails are computed in work
+// units, where "X% of the distance" is a plain linear interpolation.
+arith_uint256 TargetToWork(const arith_uint256& target)
 {
-    if (params.fPowNoRetargeting)
-        return pindexLast->nBits;
+    return (~target / (target + 1)) + 1;
+}
 
+arith_uint256 WorkToTarget(const arith_uint256& work)
+{
+    return ~work / work;
+}
+
+enum class GuardrailType { NONE, UPPER, LOWER };
+
+struct Guardrail {
+    GuardrailType type{GuardrailType::NONE};
+    //! Difficulty, in work units, the guardrail sits at
+    arith_uint256 work;
+};
+
+// Work of the period starting at period_start. The first block of a period
+// is never a testnet min-difficulty block, so it carries the real target.
+arith_uint256 PeriodWork(const CBlockIndex* pindexLast, int period_start)
+{
+    arith_uint256 target;
+    target.SetCompact(pindexLast->GetAncestor(period_start)->nBits);
+    return TargetToWork(target);
+}
+
+/**
+ * Guardrail armed for the retarget at `height` (rules 1-4 in README-DAA.md).
+ * It only depends on the difficulty of the three preceding periods, which
+ * are read from the block index, so no extra state has to be tracked.
+ */
+Guardrail GetGuardrail(const CBlockIndex* pindexLast, int height, const Consensus::Params& params)
+{
+    const int interval = params.DifficultyAdjustmentInterval();
+    // Both moves must be guardrail-era moves, and there must be a period before them.
+    if (height - 2 * interval < params.DaaGuardrailHeight || height - 3 * interval < 0) return {};
+
+    const arith_uint256 work_last = PeriodWork(pindexLast, height - interval);
+    const arith_uint256 work_prev = PeriodWork(pindexLast, height - 2 * interval);
+    const arith_uint256 work_before = PeriodWork(pindexLast, height - 3 * interval);
+
+    // Guardrail at num/10 of the distance from the last difficulty back
+    // towards the previous one, which the last move bounced away from.
+    const auto guardrail = [&](GuardrailType type, int num) {
+        return Guardrail{type, (work_last * (10 - num) + work_prev * num) / 10};
+    };
+
+    if (work_prev > work_before) {
+        // Rose, then fell by more than 10% (rule 2) or 5% (rule 1): cap the next rise
+        if (work_last * 10 < work_prev * 9) return guardrail(GuardrailType::UPPER, 8);
+        if (work_last * 20 < work_prev * 19) return guardrail(GuardrailType::UPPER, 9);
+    } else if (work_prev < work_before) {
+        // Fell, then rose by more than 50% (rule 4) or 25% (rule 3): floor the next fall
+        if (work_last * 2 > work_prev * 3) return guardrail(GuardrailType::LOWER, 8);
+        if (work_last * 4 > work_prev * 5) return guardrail(GuardrailType::LOWER, 9);
+    }
+    return {};
+}
+
+bool HitsGuardrail(const Guardrail& guardrail, const arith_uint256& work)
+{
+    return (guardrail.type == GuardrailType::UPPER && work > guardrail.work) ||
+           (guardrail.type == GuardrailType::LOWER && work < guardrail.work);
+}
+
+// The unconstrained retarget: scale by the clamped timespan of the period.
+arith_uint256 RetargetTarget(const CBlockIndex* pindexLast, int64_t nFirstBlockTime, const Consensus::Params& params)
+{
     // Limit adjustment step
     int64_t nActualTimespan = pindexLast->GetBlockTime() - nFirstBlockTime;
     if (nActualTimespan < params.nPowTargetTimespan/4)
@@ -77,6 +144,45 @@ unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nF
 
     bnNew *= nActualTimespan;
     bnNew /= params.nPowTargetTimespan;
+
+    if (bnNew > bnPowLimit)
+        bnNew = bnPowLimit;
+
+    return bnNew;
+}
+} // namespace
+
+unsigned int CalculateNextWorkRequired(const CBlockIndex* pindexLast, int64_t nFirstBlockTime, const Consensus::Params& params)
+{
+    if (params.fPowNoRetargeting)
+        return pindexLast->nBits;
+
+    const arith_uint256 bnPowLimit = UintToArith256(params.powLimit);
+    arith_uint256 bnNew = RetargetTarget(pindexLast, nFirstBlockTime, params);
+
+    // DAA ricochet guardrails, see README-DAA.md
+    const int height = pindexLast->nHeight + 1;
+    const Guardrail guardrail = GetGuardrail(pindexLast, height, params);
+    const arith_uint256 work = TargetToWork(bnNew);
+    if (HitsGuardrail(guardrail, work)) {
+        arith_uint256 new_work = guardrail.work;
+        if (guardrail.type == GuardrailType::LOWER) {
+            // Rule 5: the previous retarget hit an upper guardrail and this one
+            // hits a lower one, so settle on the average of the two.
+            const int interval = params.DifficultyAdjustmentInterval();
+            const int prev_height = height - interval;
+            const Guardrail prev_guardrail = GetGuardrail(pindexLast, prev_height, params);
+            if (prev_guardrail.type == GuardrailType::UPPER && prev_height != params.EcashHeight) {
+                const CBlockIndex* prev_last = pindexLast->GetAncestor(prev_height - 1);
+                const int64_t prev_first_time = pindexLast->GetAncestor(prev_height - interval)->GetBlockTime();
+                const arith_uint256 prev_work = TargetToWork(RetargetTarget(prev_last, prev_first_time, params));
+                if (HitsGuardrail(prev_guardrail, prev_work)) {
+                    new_work = (prev_guardrail.work + guardrail.work) / 2;
+                }
+            }
+        }
+        bnNew = WorkToTarget(new_work);
+    }
 
     // eCash fork activation difficulty reset
     if (pindexLast->nHeight + 1 == params.EcashHeight)
